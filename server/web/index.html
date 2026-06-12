@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Document Chat</title>
+  <link rel="stylesheet" href="/chat.css">
+</head>
+<body>
+  <header class="topbar">
+    <button id="sidebar-toggle" class="sidebar-toggle" type="button"
+            title="Show/hide history sidebar" aria-label="Toggle history sidebar">
+      <span class="hamburger"></span>
+    </button>
+    <div class="topbar-brand">
+      <svg class="topbar-logo" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <path d="M4 4h11l5 5v11a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1z"/>
+        <path d="M14 4v5h5"/>
+      </svg>
+      <span>Document Chat</span>
+    </div>
+    <div class="controls">
+      <div class="ctrl">
+        <span class="ctrl-label">Corpus</span>
+        <div class="brand-picker">
+          <button id="corpus-picker-btn" class="brand-picker-btn" type="button"
+                  aria-haspopup="listbox" aria-expanded="false">
+            <span id="corpus-picker-name" class="picker-brand">(loading)</span>
+            <span id="corpus-picker-count" class="picker-count"></span>
+            <span class="picker-caret" aria-hidden="true"></span>
+          </button>
+          <ul id="corpus-picker-menu" class="brand-picker-menu" role="listbox" hidden></ul>
+          <select id="corpus-select" class="brand-select-hidden" aria-hidden="true" tabindex="-1"></select>
+        </div>
+      </div>
+      <label class="ctrl toggle">
+        <input type="checkbox" id="sources-only">
+        <span>Sources only</span>
+      </label>
+      <label class="ctrl slider">
+        <span class="ctrl-label">Top-K <span id="topk-value">12</span></span>
+        <input type="range" id="topk" min="3" max="20" step="1" value="12">
+      </label>
+      <div class="ctrl">
+        <button id="upload-btn" type="button" class="upload-btn"
+                title="Upload a document to a corpus and reindex">+ Upload</button>
+      </div>
+    </div>
+  </header>
+
+  <!-- Upload modal -->
+  <div id="upload-modal" class="modal-backdrop" hidden>
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="upload-title">
+      <div class="modal-head">
+        <h3 id="upload-title">Upload a document</h3>
+        <button type="button" class="modal-close" id="upload-cancel" aria-label="Close">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div class="form-row">
+          <span>Corpus</span>
+          <div class="brand-mode">
+            <label class="radio-row">
+              <input type="radio" name="upload-corpus-mode" id="upload-corpus-mode-existing" value="existing" checked>
+              <span>Existing</span>
+            </label>
+            <label class="radio-row">
+              <input type="radio" name="upload-corpus-mode" id="upload-corpus-mode-new" value="new">
+              <span>New corpus</span>
+            </label>
+          </div>
+        </div>
+        <div class="form-row" id="upload-existing-corpus-row">
+          <select id="upload-corpus"></select>
+        </div>
+        <div class="form-row" id="upload-new-corpus-row" hidden>
+          <input type="text" id="upload-new-corpus" placeholder="lowercase, a-z 0-9 _ -">
+        </div>
+        <label class="form-row">
+          <span>File</span>
+          <input type="file" id="upload-file"
+                 accept=".pdf,.docx,.doc,.txt,.md,.markdown,.rst,.csv,.log,.json,.xml,.html,.htm">
+        </label>
+        <div id="upload-status" class="upload-status"></div>
+      </div>
+      <div class="modal-foot">
+        <button type="button" id="upload-submit" class="primary">Upload + Reindex</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="workspace">
+    <aside id="history-sidebar" class="history-sidebar">
+      <div class="sidebar-head">
+        <button id="new-chat" class="new-chat-btn" type="button">+ New chat</button>
+      </div>
+      <ul id="thread-list" class="thread-list" aria-label="Saved chat threads"></ul>
+    </aside>
+    <main id="thread" class="thread" aria-live="polite"></main>
+  </div>
+
+  <footer class="composer">
+    <textarea id="input"
+      placeholder="Ask something about the indexed documents. Enter sends, Shift+Enter for newline."
+      rows="2" aria-label="Question"></textarea>
+    <button id="send" type="button">Send</button>
+    <div id="status" class="status"></div>
+  </footer>
+
+  <script src="/chat.js"></script>
+</body>
+</html>

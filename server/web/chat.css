@@ -211,15 +211,21 @@ body.sidebar-collapsed .sidebar-toggle-floating { display: grid; }
   background: #1a1a22; border: 1px solid var(--border); border-radius: 12px;
   box-shadow: 0 14px 40px rgba(0,0,0,.45);
 }
-.corpus-picker-item {
-  display: flex; align-items: center; gap: 10px;
-  padding: 9px 10px; border-radius: 9px; cursor: pointer;
+/* read-only "sources searched" list (not a switcher) */
+.sources-menu-head {
+  font-size: 11px; font-weight: 600; letter-spacing: .04em;
+  color: var(--text-mute); padding: 4px 8px 8px;
 }
-.corpus-picker-item .picker-corpus { flex: 1; font-weight: 550; text-transform: capitalize; }
-.corpus-picker-item .picker-count { font-family: var(--mono); font-size: 11.5px; color: var(--text-mute); }
-.corpus-picker-item.hover, .corpus-picker-item:hover { background: #25252f; }
-.corpus-picker-item.active { background: #20202b; }
-.corpus-picker-item.active .picker-corpus { color: var(--accent-2); }
+.sources-menu-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 2px; }
+.sources-menu-item {
+  display: flex; align-items: baseline; gap: 8px;
+  padding: 8px 10px; border-radius: 9px;
+}
+.sources-menu-item:hover { background: #20202b; }
+.sources-menu-item .src-file { flex: 1; font-weight: 550; color: var(--text); min-width: 0; }
+.sources-menu-item .src-juris { font-size: 11px; color: var(--accent-2); white-space: nowrap; }
+.sources-menu-item .src-count { font-family: var(--mono); font-size: 11px; color: var(--text-mute); white-space: nowrap; }
+.sources-menu-empty { color: var(--text-mute); font-size: 13px; padding: 6px 8px; }
 
 /* ---- settings popover ------------------------------------------------ */
 .settings-wrap { position: relative; }

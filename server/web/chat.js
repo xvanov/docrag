@@ -36,6 +36,7 @@
     inflight: false,
     sourceMap: {},       // assistantMsgId -> array of source-card elements (1-indexed)
     corpora: [],
+    sources: [],         // documents in the active corpus (read-only display)
     threads: [],
     activeThreadId: null,
     pickerOpen: false,
@@ -62,6 +63,7 @@
     pickerName: document.getElementById("corpus-picker-name"),
     pickerCount: document.getElementById("corpus-picker-count"),
     pickerMenu: document.getElementById("corpus-picker-menu"),
+    sourcesList: document.getElementById("sources-list"),
     // Settings popover
     settingsBtn: document.getElementById("settings-btn"),
     settingsMenu: document.getElementById("settings-menu"),
@@ -319,67 +321,52 @@
     renderSidebar();
   }
 
-  // ---------- Corpus picker ----------
+  // ---------- Sources popover (read-only; NOT a corpus switcher) ----------
+  //
+  // The chat is locked onto one unified corpus. The top-left chip just shows
+  // which documents are searched for every answer; it never switches corpora.
 
-  function renderPickerMenu() {
-    els.pickerMenu.innerHTML = "";
-    for (var i = 0; i < state.corpora.length; i++) {
-      var slug = state.corpora[i];
-      var item = el("li", {
-        className: "corpus-picker-item" + (slug === state.corpus ? " active" : ""),
-        attrs: { "data-slug": slug, role: "option" },
-      }, [
-        el("span", { className: "picker-corpus", text: slug }),
-      ]);
-      (function (s, node) {
-        node.addEventListener("click", function () { selectCorpus(s); closePicker(); });
-        node.addEventListener("mouseenter", function () {
-          state.hoverIdx = indexOfMenuItem(node); updateHover();
-        });
-      })(slug, item);
-      els.pickerMenu.appendChild(item);
+  function prettyCorpus(slug) {
+    if (!slug) return "Sources";
+    return slug.replace(/[-_]/g, " ").replace(/\b\w/g, function (c) { return c.toUpperCase(); });
+  }
+
+  function renderSourcesList() {
+    if (!els.sourcesList) return;
+    els.sourcesList.innerHTML = "";
+    if (!state.sources.length) {
+      els.sourcesList.appendChild(el("li", { className: "sources-menu-empty", text: "(no documents indexed)" }));
+      return;
     }
-  }
-
-  function indexOfMenuItem(node) {
-    var items = els.pickerMenu.querySelectorAll(".corpus-picker-item");
-    for (var i = 0; i < items.length; i++) if (items[i] === node) return i;
-    return -1;
-  }
-
-  function updateHover() {
-    var items = els.pickerMenu.querySelectorAll(".corpus-picker-item");
-    for (var i = 0; i < items.length; i++)
-      items[i].classList.toggle("hover", i === state.hoverIdx);
+    state.sources.forEach(function (s) {
+      els.sourcesList.appendChild(el("li", { className: "sources-menu-item" }, [
+        el("span", { className: "src-file", text: s.file || "unknown" }),
+        s.jurisdiction ? el("span", { className: "src-juris", text: s.jurisdiction }) : null,
+        el("span", { className: "src-count", text: (s.chunks || 0).toLocaleString() }),
+      ]));
+    });
   }
 
   function openPicker() {
     if (state.pickerOpen) return;
-    renderPickerMenu();
     els.pickerMenu.hidden = false;
     els.pickerBtn.setAttribute("aria-expanded", "true");
     state.pickerOpen = true;
-    state.hoverIdx = Math.max(0, state.corpora.indexOf(state.corpus));
-    updateHover();
   }
-
   function closePicker() {
     if (!state.pickerOpen) return;
     els.pickerMenu.hidden = true;
     els.pickerBtn.setAttribute("aria-expanded", "false");
     state.pickerOpen = false;
-    state.hoverIdx = -1;
   }
-
   function togglePicker() { state.pickerOpen ? closePicker() : openPicker(); }
 
   function renderPickerButton() {
-    els.pickerName.textContent = state.corpus || "(none)";
-    els.pickerCount.textContent = "";
+    els.pickerName.textContent = prettyCorpus(state.corpus);
+    var n = state.sources.length;
+    els.pickerCount.textContent = n ? (n + (n === 1 ? " doc" : " docs")) : "";
     updateGroundedText();
   }
-
-  function selectCorpus(slug) { setActiveCorpus(slug, true); }
 
   function setActiveCorpus(slug, resetHistory) {
     if (!slug) return;
@@ -389,31 +376,42 @@
     if (resetHistory) { state.history = []; state.activeThreadId = null; }
   }
 
+  async function loadSources() {
+    state.sources = [];
+    try {
+      var url = "/api/sources" + (state.corpus ? "?corpus=" + encodeURIComponent(state.corpus) : "");
+      var r = await fetch(url);
+      if (r.ok) {
+        var data = await r.json();
+        state.sources = data.sources || [];
+      }
+    } catch (e) { console.warn("sources load failed", e); }
+    renderSourcesList();
+    renderPickerButton();
+  }
+
   async function loadCorpora() {
     try {
       var r = await fetch("/api/corpora");
       if (!r.ok) throw new Error("corpora HTTP " + r.status);
       var data = await r.json();
       var corpora = data.corpora || [];
-      state.corpora = corpora.slice();
+      state.corpora = corpora.slice();   // full list (used by the upload modal)
+      // Lock onto the server's primary corpus -- no switching in the UI.
+      var primary = data.primary || (corpora.indexOf("building-codes") >= 0 ? "building-codes" : corpora[0]) || "";
       els.corpus.innerHTML = "";
-      if (!corpora.length) {
+      if (!primary) {
         els.corpus.appendChild(el("option", { text: "(no corpora)", attrs: { value: "" } }));
         els.pickerName.textContent = "(no corpora)";
         updateGroundedText();
         return;
       }
-      // Prefer building-codes if present, else keep current, else first.
-      var def = state.corpus && corpora.indexOf(state.corpus) >= 0
-        ? state.corpus
-        : (corpora.indexOf("building-codes") >= 0 ? "building-codes" : corpora[0]);
-      for (var i = 0; i < corpora.length; i++) {
-        var o = el("option", { text: corpora[i], attrs: { value: corpora[i] } });
-        if (corpora[i] === def) o.selected = true;
-        els.corpus.appendChild(o);
-      }
-      state.corpus = def;
+      var o = el("option", { text: primary, attrs: { value: primary } });
+      o.selected = true;
+      els.corpus.appendChild(o);
+      state.corpus = primary;
       renderPickerButton();
+      loadSources();
     } catch (e) {
       setStatus("corpus load failed");
       console.error(e);
@@ -827,17 +825,9 @@
   });
   els.input.addEventListener("input", autoGrowInput);
 
-  els.corpus.addEventListener("change", function () {
-    if (els.corpus.value && els.corpus.value !== state.corpus) {
-      state.corpus = els.corpus.value;
-      state.history = [];
-      state.activeThreadId = null;
-      renderPickerButton();
-    }
-  });
   els.topk.addEventListener("input", function () { els.topkValue.textContent = els.topk.value; });
 
-  // Corpus picker open/close + outside-click + keyboard.
+  // Sources popover open/close + outside-click + Escape (read-only).
   els.pickerBtn.addEventListener("click", function (ev) { ev.stopPropagation(); togglePicker(); });
   document.addEventListener("click", function (ev) {
     if (!state.pickerOpen) return;
@@ -845,18 +835,7 @@
     closePicker();
   });
   document.addEventListener("keydown", function (ev) {
-    if (!state.pickerOpen) return;
-    var items = els.pickerMenu.querySelectorAll(".corpus-picker-item");
-    if (ev.key === "Escape") { closePicker(); ev.preventDefault(); }
-    else if (ev.key === "ArrowDown") { state.hoverIdx = Math.min(items.length - 1, state.hoverIdx + 1); updateHover(); ev.preventDefault(); }
-    else if (ev.key === "ArrowUp") { state.hoverIdx = Math.max(0, state.hoverIdx - 1); updateHover(); ev.preventDefault(); }
-    else if (ev.key === "Enter") {
-      if (state.hoverIdx >= 0 && items[state.hoverIdx]) {
-        var slug = items[state.hoverIdx].getAttribute("data-slug");
-        if (slug) { selectCorpus(slug); closePicker(); }
-      }
-      ev.preventDefault();
-    }
+    if (state.pickerOpen && ev.key === "Escape") { closePicker(); ev.preventDefault(); }
   });
 
   els.sidebarToggle.addEventListener("click", toggleSidebar);

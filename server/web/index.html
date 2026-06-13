@@ -44,12 +44,17 @@
           </button>
           <div class="corpus-picker">
             <button id="corpus-picker-btn" class="corpus-picker-btn" type="button"
-                    aria-haspopup="listbox" aria-expanded="false">
-              <span id="corpus-picker-name" class="picker-corpus">(loading)</span>
+                    aria-haspopup="dialog" aria-expanded="false"
+                    title="Documents searched for every answer">
+              <span id="corpus-picker-name" class="picker-corpus">Sources</span>
               <span id="corpus-picker-count" class="picker-count"></span>
               <span class="picker-caret" aria-hidden="true"></span>
             </button>
-            <ul id="corpus-picker-menu" class="corpus-picker-menu" role="listbox" hidden></ul>
+            <div id="corpus-picker-menu" class="corpus-picker-menu" role="dialog"
+                 aria-label="Sources searched" hidden>
+              <div class="sources-menu-head">Every answer searches all of these:</div>
+              <ul id="sources-list" class="sources-menu-list"></ul>
+            </div>
             <select id="corpus-select" class="corpus-select-hidden" aria-hidden="true" tabindex="-1"></select>
           </div>
         </div>

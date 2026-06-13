@@ -50,13 +50,16 @@ import urllib.parse
 from docrag import settings
 from docrag.answer import answer as rag_answer_call
 from docrag.query import rag_query
-from docrag.db import valid_corpus
+from docrag.db import open_db, valid_corpus
 
 
 DEFAULT_PORT = 8099
 PORT_SCAN_RANGE = 10
 WEB_DIR = os.path.join(_HERE, "web")
 HISTORY_CAP = 6
+
+# Corpora that default to jurisdiction-balanced retrieval (IBC / NC / Durham).
+_BALANCED_CORPORA = {"building-codes"}
 
 MIME_TYPES = {
     ".html": "text/html; charset=utf-8",
@@ -116,6 +119,52 @@ def _list_corpora() -> list:
         return []
     out = [f[:-3] for f in os.listdir(idx) if f.lower().endswith(".db")]
     out.sort()
+    return out
+
+
+# Preferred unified corpus for the chat UI. The UI is not a corpus switcher --
+# it locks onto one corpus and just lists the documents inside it. (The
+# standalone "udo" corpus is fully contained in "building-codes".)
+_PRIMARY_CORPORA = ("building-codes",)
+# Subfolder -> human label for the source list.
+_JURISDICTION_LABELS = {
+    "model": "Model code (IBC)",
+    "durham": "Durham (local)",
+    "north-carolina": "North Carolina (state)",
+}
+
+
+def _primary_corpus() -> str:
+    """The corpus the chat UI locks onto: first preferred one that exists,
+    else the first corpus alphabetically, else "" (none indexed)."""
+    corpora = _list_corpora()
+    for pref in _PRIMARY_CORPORA:
+        if pref in corpora:
+            return pref
+    return corpora[0] if corpora else ""
+
+
+def _corpus_sources(corpus: str) -> list:
+    """List the distinct source documents indexed in a corpus, with chunk
+    counts and a jurisdiction label derived from the top-level subfolder."""
+    conn = open_db(corpus)
+    try:
+        rows = conn.execute(
+            "SELECT source_file, MIN(path) AS p, COUNT(*) AS n "
+            "FROM chunks GROUP BY source_file ORDER BY p"
+        ).fetchall()
+    finally:
+        conn.close()
+    out = []
+    for source_file, path, n in rows:
+        folder = (path or "").split("/")[0] if "/" in (path or "") else ""
+        label = _JURISDICTION_LABELS.get(folder, folder.replace("-", " ").title())
+        out.append({
+            "file": source_file,
+            "path": path,
+            "jurisdiction": label,
+            "chunks": int(n),
+        })
     return out
 
 
@@ -332,6 +381,8 @@ class DocRagHandler(http.server.BaseHTTPRequestHandler):
             self._serve_static("chat.css")
         elif path == "/api/corpora":
             self._handle_corpora()
+        elif path == "/api/sources":
+            self._handle_sources(urllib.parse.parse_qs(parsed.query))
         elif path == "/api/health":
             self._send_json({"ok": True, "ts": _now_iso_utc()})
         elif path == "/source":
@@ -364,9 +415,28 @@ class DocRagHandler(http.server.BaseHTTPRequestHandler):
 
     def _handle_corpora(self):
         try:
-            self._send_json({"corpora": _list_corpora()})
+            self._send_json({"corpora": _list_corpora(),
+                             "primary": _primary_corpus()})
         except Exception as e:  # noqa: BLE001
             self._send_error_json(500, str(e))
+
+    def _handle_sources(self, qs):
+        raw_corpus = (qs.get("corpus") or [""])[0] or _primary_corpus()
+        if not raw_corpus:
+            self._send_json({"corpus": "", "sources": []})
+            return
+        try:
+            corpus = _validate_corpus(raw_corpus)
+        except ValueError:
+            self._send_error_json(400, "invalid corpus name")
+            return
+        try:
+            sources = _corpus_sources(corpus)
+        except Exception as e:  # noqa: BLE001
+            sys.stderr.write("[sources] %s\n" % e)
+            self._send_error_json(500, str(e))
+            return
+        self._send_json({"corpus": corpus, "sources": sources})
 
     def _handle_chat(self, body):
         raw_corpus = body.get("corpus") or ""
@@ -393,10 +463,20 @@ class DocRagHandler(http.server.BaseHTTPRequestHandler):
         if isinstance(history, list) and len(history) > HISTORY_CAP:
             history = history[-HISTORY_CAP:]
 
+        # Cross-jurisdiction "mode": balance retrieval across IBC / NC / Durham.
+        # Auto-on for the multi-source building-codes corpus; client may override
+        # with an explicit {"balance": true|false}.
+        if "balance" in body:
+            balance = bool(body.get("balance"))
+        else:
+            balance = corpus in _BALANCED_CORPORA
+        if balance:
+            top_k = max(top_k, 15)
+
         t0 = time.monotonic()
         try:
             if sources_only:
-                retrieval = rag_query(corpus, query, top_k=top_k)
+                retrieval = rag_query(corpus, query, top_k=top_k, balance=balance)
                 envelope = {
                     "answer": None, "citations": [],
                     "chunks": retrieval.get("results") or [],
@@ -407,7 +487,8 @@ class DocRagHandler(http.server.BaseHTTPRequestHandler):
                 }
             else:
                 envelope = rag_answer_call(corpus=corpus, query=query,
-                                           history=history, top_k=top_k)
+                                           history=history, top_k=top_k,
+                                           balance=balance)
                 envelope["sources_only"] = False
         except FileNotFoundError as e:
             sys.stderr.write("[chat] DB missing: %s\n" % e)
@@ -425,6 +506,7 @@ class DocRagHandler(http.server.BaseHTTPRequestHandler):
         envelope["elapsed_ms"] = int((time.monotonic() - t0) * 1000)
         envelope["corpus"] = corpus
         envelope["query"] = query
+        envelope["balance"] = balance
         self._send_json(envelope)
 
     def _handle_source(self, qs):

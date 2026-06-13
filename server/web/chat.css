@@ -53,13 +53,20 @@ a:hover { text-decoration: underline; }
 .app {
   display: grid;
   grid-template-columns: 264px 1fr;
+  grid-template-rows: minmax(0, 1fr);
   height: 100vh;
   overflow: hidden;
+  transition: grid-template-columns .22s ease;
 }
+/* Collapse the sidebar's grid track so the main pane actually reclaims the
+   space (a negative margin alone leaves the 264px column behind). */
+body.sidebar-collapsed .app { grid-template-columns: 0 1fr; }
 .main {
   display: flex;
   flex-direction: column;
   min-width: 0;
+  min-height: 0;
+  overflow: hidden;
   position: relative;
 }
 

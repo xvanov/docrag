@@ -1,29 +1,41 @@
 /* docrag chat -- client logic. Plain DOM, no framework.
  *
+ * Dark UI adapted from the knowledge-RAG doc_chat client, wired to docrag's
+ * endpoints (/api/corpora, /api/chat, /api/rate, /api/upload, /source) with
+ * all brand / distill / attach / advanced machinery removed.
+ *
  * State:
  *   - corpus: selected corpus slug.
- *   - history: last 6 {role, content} turns sent to the server.
+ *   - history: recent {role, content} turns sent to the server.
  *   - threads: chats persisted in localStorage.
+ *   - activeThreadId: id of the thread shown, or null for a fresh chat
+ *     (lazily minted on first send).
  */
 
 (function () {
   "use strict";
 
-  var HISTORY_CAP = 6;
-  var THREAD_HISTORY_CAP = 12;
-  var THREAD_CAP = 50;
+  var HISTORY_CAP = 12;            // turns sent to server (server re-budgets)
+  var THREAD_HISTORY_CAP = 24;     // messages stored per thread
+  var THREAD_CAP = 50;             // total threads kept in localStorage
   var SIDEBAR_RENDER_CAP = 30;
   var PREVIEW_CHARS = 300;
   var STORE_KEY = "docrag_threads_v1";
   var SIDEBAR_KEY = "docrag_sidebar_collapsed_v1";
 
+  var SUGGESTIONS = [
+    "What are the minimum egress door width requirements?",
+    "How is fire separation distance measured?",
+    "What are the setback requirements for an accessory dwelling unit?",
+    "Summarize the occupancy classification groups.",
+  ];
+
   var state = {
     corpus: "",
     history: [],
     inflight: false,
-    sourceMap: {},
+    sourceMap: {},       // assistantMsgId -> array of source-card elements (1-indexed)
     corpora: [],
-    counts: {},          // corpus -> chunk count (null = unknown)
     threads: [],
     activeThreadId: null,
     pickerOpen: false,
@@ -39,14 +51,21 @@
     sourcesOnly: document.getElementById("sources-only"),
     topk: document.getElementById("topk"),
     topkValue: document.getElementById("topk-value"),
+    // Sidebar
     sidebar: document.getElementById("history-sidebar"),
     sidebarToggle: document.getElementById("sidebar-toggle"),
+    sidebarToggleFloating: document.getElementById("sidebar-toggle-floating"),
     threadList: document.getElementById("thread-list"),
     newChatBtn: document.getElementById("new-chat"),
+    // Corpus picker
     pickerBtn: document.getElementById("corpus-picker-btn"),
     pickerName: document.getElementById("corpus-picker-name"),
     pickerCount: document.getElementById("corpus-picker-count"),
     pickerMenu: document.getElementById("corpus-picker-menu"),
+    // Settings popover
+    settingsBtn: document.getElementById("settings-btn"),
+    settingsMenu: document.getElementById("settings-menu"),
+    // Upload modal
     uploadBtn: document.getElementById("upload-btn"),
     uploadModal: document.getElementById("upload-modal"),
     uploadCancel: document.getElementById("upload-cancel"),
@@ -59,6 +78,19 @@
     uploadFile: document.getElementById("upload-file"),
     uploadSubmit: document.getElementById("upload-submit"),
     uploadStatus: document.getElementById("upload-status"),
+    // Help modal
+    helpBtn: document.getElementById("help-btn"),
+    helpModal: document.getElementById("help-modal"),
+    helpCancel: document.getElementById("help-cancel"),
+    // Welcome / relocatable composer
+    welcome: document.getElementById("welcome"),
+    welcomeGreeting: document.getElementById("welcome-greeting"),
+    welcomeSub: document.getElementById("welcome-sub"),
+    suggestions: document.getElementById("suggestions"),
+    composer: document.getElementById("composer"),
+    composerDockWelcome: document.getElementById("composer-dock-welcome"),
+    composerDockBottom: document.getElementById("composer-dock-bottom"),
+    composerGrounded: document.getElementById("composer-grounded"),
   };
 
   // ---------- Utils ----------
@@ -212,7 +244,7 @@
 
   function buildThreadRow(thread) {
     var head = el("div", { className: "row-head" }, [
-      el("span", { className: "row-brand", text: thread.corpus || "?" }),
+      el("span", { className: "row-corpus", text: thread.corpus || "?" }),
       el("span", { html: "&middot;" }),
       el("span", { className: "row-time", text: relativeTime(thread.ts_last) }),
     ]);
@@ -242,7 +274,7 @@
       state.activeThreadId = null;
       state.history = [];
       clearThreadDiv();
-      showEmptyState();
+      showWelcome();
     }
     renderSidebar();
   }
@@ -258,6 +290,7 @@
     state.activeThreadId = id;
     state.history = [];
     clearThreadDiv();
+    showConversation();
     if (thread.corpus && thread.corpus !== state.corpus)
       setActiveCorpus(thread.corpus, false);
     for (var i = 0; i < thread.history.length; i++) {
@@ -288,21 +321,15 @@
 
   // ---------- Corpus picker ----------
 
-  function formatCount(n) {
-    if (n === null || n === undefined) return "";
-    return n.toLocaleString() + " chunks";
-  }
-
   function renderPickerMenu() {
     els.pickerMenu.innerHTML = "";
     for (var i = 0; i < state.corpora.length; i++) {
       var slug = state.corpora[i];
       var item = el("li", {
-        className: "brand-picker-item" + (slug === state.corpus ? " active" : ""),
+        className: "corpus-picker-item" + (slug === state.corpus ? " active" : ""),
         attrs: { "data-slug": slug, role: "option" },
       }, [
-        el("span", { className: "picker-brand", text: slug }),
-        el("span", { className: "picker-count", text: formatCount(state.counts[slug]) }),
+        el("span", { className: "picker-corpus", text: slug }),
       ]);
       (function (s, node) {
         node.addEventListener("click", function () { selectCorpus(s); closePicker(); });
@@ -315,13 +342,13 @@
   }
 
   function indexOfMenuItem(node) {
-    var items = els.pickerMenu.querySelectorAll(".brand-picker-item");
+    var items = els.pickerMenu.querySelectorAll(".corpus-picker-item");
     for (var i = 0; i < items.length; i++) if (items[i] === node) return i;
     return -1;
   }
 
   function updateHover() {
-    var items = els.pickerMenu.querySelectorAll(".brand-picker-item");
+    var items = els.pickerMenu.querySelectorAll(".corpus-picker-item");
     for (var i = 0; i < items.length; i++)
       items[i].classList.toggle("hover", i === state.hoverIdx);
   }
@@ -348,7 +375,8 @@
 
   function renderPickerButton() {
     els.pickerName.textContent = state.corpus || "(none)";
-    els.pickerCount.textContent = formatCount(state.counts[state.corpus]);
+    els.pickerCount.textContent = "";
+    updateGroundedText();
   }
 
   function selectCorpus(slug) { setActiveCorpus(slug, true); }
@@ -372,10 +400,13 @@
       if (!corpora.length) {
         els.corpus.appendChild(el("option", { text: "(no corpora)", attrs: { value: "" } }));
         els.pickerName.textContent = "(no corpora)";
-        showEmptyState();
+        updateGroundedText();
         return;
       }
-      var def = state.corpus && corpora.indexOf(state.corpus) >= 0 ? state.corpus : corpora[0];
+      // Prefer building-codes if present, else keep current, else first.
+      var def = state.corpus && corpora.indexOf(state.corpus) >= 0
+        ? state.corpus
+        : (corpora.indexOf("building-codes") >= 0 ? "building-codes" : corpora[0]);
       for (var i = 0; i < corpora.length; i++) {
         var o = el("option", { text: corpora[i], attrs: { value: corpora[i] } });
         if (corpora[i] === def) o.selected = true;
@@ -389,14 +420,78 @@
     }
   }
 
-  function showEmptyState() {
-    els.thread.appendChild(el("div", { className: "empty" }, [
-      el("h2", { text: "Ask the documents anything." }),
-      el("div", {
-        text: "Answers are grounded in the indexed corpus. " +
-              "Citations [N] link to source chunks below the answer.",
-      }),
-    ]));
+  // ---------- Welcome state + relocatable composer ----------
+
+  function greetingText() {
+    var h = new Date().getHours();
+    if (h < 12) return "Good morning";
+    if (h < 18) return "Good afternoon";
+    return "Good evening";
+  }
+
+  function updateGroundedText() {
+    var corpus = state.corpus || "";
+    if (els.welcomeSub) {
+      els.welcomeSub.innerHTML = corpus
+        ? "Ask anything grounded in the <b>" + escapeHtml(corpus) + "</b> documentation."
+        : "Select a corpus to begin.";
+    }
+    if (els.composerGrounded) {
+      if (corpus) {
+        els.composerGrounded.textContent = "Grounded in " + corpus;
+        els.composerGrounded.classList.remove("cold");
+      } else {
+        els.composerGrounded.textContent = "No corpus selected";
+        els.composerGrounded.classList.add("cold");
+      }
+    }
+  }
+
+  function renderSuggestions() {
+    if (!els.suggestions) return;
+    els.suggestions.innerHTML = "";
+    SUGGESTIONS.forEach(function (text) {
+      var card = el("button", {
+        className: "suggestion", attrs: { type: "button" },
+      }, [
+        el("span", { className: "s-arrow", html: "&#9656;" }),
+        el("span", { text: text }),
+      ]);
+      card.addEventListener("click", function () {
+        els.input.value = text;
+        autoGrowInput();
+        send();
+      });
+      els.suggestions.appendChild(card);
+    });
+  }
+
+  function showWelcome() {
+    document.body.classList.add("is-welcome");
+    if (els.composer && els.composerDockWelcome &&
+        els.composer.parentNode !== els.composerDockWelcome) {
+      els.composerDockWelcome.appendChild(els.composer);
+    }
+    if (els.welcomeGreeting) els.welcomeGreeting.textContent = greetingText();
+    updateGroundedText();
+    renderSuggestions();
+    autoGrowInput();
+  }
+
+  function showConversation() {
+    document.body.classList.remove("is-welcome");
+    if (els.composer && els.composerDockBottom &&
+        els.composer.parentNode !== els.composerDockBottom) {
+      els.composerDockBottom.appendChild(els.composer);
+    }
+    autoGrowInput();
+  }
+
+  function autoGrowInput() {
+    var ta = els.input;
+    if (!ta) return;
+    ta.style.height = "auto";
+    ta.style.height = Math.min(ta.scrollHeight, 200) + "px";
   }
 
   // ---------- Render ----------
@@ -657,15 +752,16 @@
     var query = els.input.value.trim();
     if (!query) return;
     var corpus = els.corpus.value;
-    if (!corpus) { renderErrorMessage("no corpus selected"); return; }
+    if (!corpus) { showConversation(); renderErrorMessage("no corpus selected"); return; }
     var sourcesOnly = els.sourcesOnly.checked;
     var topK = parseInt(els.topk.value, 10) || 12;
 
+    showConversation();
     if (!state.activeThreadId) clearThreadDiv();
-    else { var empty = els.thread.querySelector(".empty"); if (empty) empty.remove(); }
 
     renderUserMessage(query);
     els.input.value = "";
+    autoGrowInput();
     pushUserToThread(query);
 
     var historyForServer = state.history.slice(-HISTORY_CAP);
@@ -707,16 +803,18 @@
     var collapsed = false;
     try { collapsed = window.localStorage.getItem(SIDEBAR_KEY) === "1"; } catch (e) {}
     els.sidebar.classList.toggle("collapsed", collapsed);
+    document.body.classList.toggle("sidebar-collapsed", collapsed);
   }
   function toggleSidebar() {
     var collapsed = els.sidebar.classList.toggle("collapsed");
+    document.body.classList.toggle("sidebar-collapsed", collapsed);
     try { window.localStorage.setItem(SIDEBAR_KEY, collapsed ? "1" : "0"); } catch (e) {}
   }
   function newChat() {
     state.activeThreadId = null;
     state.history = [];
     clearThreadDiv();
-    showEmptyState();
+    showWelcome();
     renderSidebar();
     els.input.focus();
   }
@@ -727,6 +825,8 @@
   els.input.addEventListener("keydown", function (ev) {
     if (ev.key === "Enter" && !ev.shiftKey) { ev.preventDefault(); send(); }
   });
+  els.input.addEventListener("input", autoGrowInput);
+
   els.corpus.addEventListener("change", function () {
     if (els.corpus.value && els.corpus.value !== state.corpus) {
       state.corpus = els.corpus.value;
@@ -737,6 +837,7 @@
   });
   els.topk.addEventListener("input", function () { els.topkValue.textContent = els.topk.value; });
 
+  // Corpus picker open/close + outside-click + keyboard.
   els.pickerBtn.addEventListener("click", function (ev) { ev.stopPropagation(); togglePicker(); });
   document.addEventListener("click", function (ev) {
     if (!state.pickerOpen) return;
@@ -745,7 +846,7 @@
   });
   document.addEventListener("keydown", function (ev) {
     if (!state.pickerOpen) return;
-    var items = els.pickerMenu.querySelectorAll(".brand-picker-item");
+    var items = els.pickerMenu.querySelectorAll(".corpus-picker-item");
     if (ev.key === "Escape") { closePicker(); ev.preventDefault(); }
     else if (ev.key === "ArrowDown") { state.hoverIdx = Math.min(items.length - 1, state.hoverIdx + 1); updateHover(); ev.preventDefault(); }
     else if (ev.key === "ArrowUp") { state.hoverIdx = Math.max(0, state.hoverIdx - 1); updateHover(); ev.preventDefault(); }
@@ -759,7 +860,27 @@
   });
 
   els.sidebarToggle.addEventListener("click", toggleSidebar);
+  if (els.sidebarToggleFloating) els.sidebarToggleFloating.addEventListener("click", toggleSidebar);
   els.newChatBtn.addEventListener("click", newChat);
+
+  // ---------- Settings popover ----------
+
+  function toggleSettingsMenu(force) {
+    var open = force !== undefined ? force : els.settingsMenu.hidden;
+    els.settingsMenu.hidden = !open;
+    els.settingsBtn.setAttribute("aria-expanded", open ? "true" : "false");
+  }
+  if (els.settingsBtn) {
+    els.settingsBtn.addEventListener("click", function (ev) { ev.stopPropagation(); toggleSettingsMenu(); });
+    document.addEventListener("click", function (ev) {
+      if (els.settingsMenu.hidden) return;
+      if (els.settingsMenu.contains(ev.target) || els.settingsBtn.contains(ev.target)) return;
+      toggleSettingsMenu(false);
+    });
+    document.addEventListener("keydown", function (ev) {
+      if (ev.key === "Escape" && !els.settingsMenu.hidden) toggleSettingsMenu(false);
+    });
+  }
 
   // ---------- Upload modal ----------
 
@@ -866,10 +987,23 @@
     });
   }
 
+  // ---------- Help modal ----------
+
+  if (els.helpBtn && els.helpModal) {
+    els.helpBtn.addEventListener("click", function () { els.helpModal.hidden = false; });
+    if (els.helpCancel) els.helpCancel.addEventListener("click", function () { els.helpModal.hidden = true; });
+    els.helpModal.addEventListener("click", function (ev) {
+      if (ev.target === els.helpModal) els.helpModal.hidden = true;
+    });
+    document.addEventListener("keydown", function (ev) {
+      if (ev.key === "Escape" && !els.helpModal.hidden) els.helpModal.hidden = true;
+    });
+  }
+
   // ---------- Init ----------
   state.threads = loadThreadsFromStore();
   applySidebarState();
   renderSidebar();
-  showEmptyState();
+  showWelcome();
   loadCorpora();
 })();

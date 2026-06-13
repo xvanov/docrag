@@ -3,62 +3,136 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Document Chat</title>
+  <title>docrag</title>
   <link rel="stylesheet" href="/chat.css">
 </head>
-<body>
-  <header class="topbar">
-    <button id="sidebar-toggle" class="sidebar-toggle" type="button"
-            title="Show/hide history sidebar" aria-label="Toggle history sidebar">
-      <span class="hamburger"></span>
-    </button>
-    <div class="topbar-brand">
-      <svg class="topbar-logo" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-        <path d="M4 4h11l5 5v11a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1z"/>
-        <path d="M14 4v5h5"/>
-      </svg>
-      <span>Document Chat</span>
-    </div>
-    <div class="controls">
-      <div class="ctrl">
-        <span class="ctrl-label">Corpus</span>
-        <div class="brand-picker">
-          <button id="corpus-picker-btn" class="brand-picker-btn" type="button"
-                  aria-haspopup="listbox" aria-expanded="false">
-            <span id="corpus-picker-name" class="picker-brand">(loading)</span>
-            <span id="corpus-picker-count" class="picker-count"></span>
-            <span class="picker-caret" aria-hidden="true"></span>
-          </button>
-          <ul id="corpus-picker-menu" class="brand-picker-menu" role="listbox" hidden></ul>
-          <select id="corpus-select" class="brand-select-hidden" aria-hidden="true" tabindex="-1"></select>
-        </div>
+<body class="is-welcome">
+  <div class="app">
+    <!-- ============================ SIDEBAR ============================ -->
+    <aside id="history-sidebar" class="sidebar">
+      <div class="sidebar-head">
+        <span class="wordmark">
+          <strong>docrag</strong>
+          <small>Document RAG</small>
+        </span>
+        <button id="sidebar-toggle" class="icon-btn sidebar-toggle" type="button"
+                title="Hide history sidebar" aria-label="Toggle history sidebar">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"/><line x1="9" y1="4" x2="9" y2="20"/></svg>
+        </button>
       </div>
-      <label class="ctrl toggle">
-        <input type="checkbox" id="sources-only">
-        <span>Sources only</span>
-      </label>
-      <label class="ctrl slider">
-        <span class="ctrl-label">Top-K <span id="topk-value">12</span></span>
-        <input type="range" id="topk" min="3" max="20" step="1" value="12">
-      </label>
-      <div class="ctrl">
-        <button id="upload-btn" type="button" class="upload-btn"
-                title="Upload a document to a corpus and reindex">+ Upload</button>
-      </div>
-    </div>
-  </header>
 
+      <div class="sidebar-body">
+        <button id="new-chat" class="new-chat-btn" type="button">
+          <span class="plus" aria-hidden="true">+</span> New chat
+        </button>
+        <div class="recent-label">Recent</div>
+        <ul id="thread-list" class="thread-list" aria-label="Saved chat threads"></ul>
+      </div>
+
+      <div class="sidebar-foot">
+        <span class="foot-note">Grounded, cited answers</span>
+      </div>
+    </aside>
+
+    <!-- ============================== MAIN ============================== -->
+    <div class="main">
+      <header class="topbar">
+        <div class="topbar-left">
+          <button id="sidebar-toggle-floating" class="icon-btn sidebar-toggle-floating" type="button"
+                  title="Show history sidebar" aria-label="Show history sidebar">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"/><line x1="9" y1="4" x2="9" y2="20"/></svg>
+          </button>
+          <div class="corpus-picker">
+            <button id="corpus-picker-btn" class="corpus-picker-btn" type="button"
+                    aria-haspopup="listbox" aria-expanded="false">
+              <span id="corpus-picker-name" class="picker-corpus">(loading)</span>
+              <span id="corpus-picker-count" class="picker-count"></span>
+              <span class="picker-caret" aria-hidden="true"></span>
+            </button>
+            <ul id="corpus-picker-menu" class="corpus-picker-menu" role="listbox" hidden></ul>
+            <select id="corpus-select" class="corpus-select-hidden" aria-hidden="true" tabindex="-1"></select>
+          </div>
+        </div>
+
+        <div class="topbar-actions">
+          <button id="upload-btn" type="button" class="action-btn"
+                  title="Add a document to a corpus's permanent library (reindexes the corpus).">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 16V4m0 0L7 9m5-5l5 5"/><path d="M4 17v2a1 1 0 001 1h14a1 1 0 001-1v-2"/></svg>
+            <span>Add doc</span>
+          </button>
+          <button id="help-btn" type="button" class="icon-btn"
+                  title="Which file types can I upload?" aria-haspopup="dialog">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><line x1="12" y1="11" x2="12" y2="16"/><circle cx="12" cy="7.6" r="0.6" fill="currentColor" stroke="none"/></svg>
+          </button>
+          <div class="settings-wrap">
+            <button id="settings-btn" type="button" class="icon-btn"
+                    title="Chat settings" aria-haspopup="true" aria-expanded="false">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.6 1.6 0 00.3 1.8l.1.1a2 2 0 11-2.8 2.8l-.1-.1a1.6 1.6 0 00-1.8-.3 1.6 1.6 0 00-1 1.5V21a2 2 0 11-4 0v-.1a1.6 1.6 0 00-1-1.5 1.6 1.6 0 00-1.8.3l-.1.1a2 2 0 11-2.8-2.8l.1-.1a1.6 1.6 0 00.3-1.8 1.6 1.6 0 00-1.5-1H3a2 2 0 110-4h.1a1.6 1.6 0 001.5-1 1.6 1.6 0 00-.3-1.8l-.1-.1a2 2 0 112.8-2.8l.1.1a1.6 1.6 0 001.8.3H9a1.6 1.6 0 001-1.5V3a2 2 0 114 0v.1a1.6 1.6 0 001 1.5 1.6 1.6 0 001.8-.3l.1-.1a2 2 0 112.8 2.8l-.1.1a1.6 1.6 0 00-.3 1.8V9a1.6 1.6 0 001.5 1H21a2 2 0 110 4h-.1a1.6 1.6 0 00-1.5 1z"/></svg>
+            </button>
+            <div id="settings-menu" class="settings-menu" hidden role="menu">
+              <label class="settings-row toggle"
+                     title="Skip the LLM and return the raw retrieved chunks.">
+                <input type="checkbox" id="sources-only">
+                <span>Sources only</span>
+              </label>
+              <label class="settings-row slider">
+                <span class="ctrl-label">Top-K <span id="topk-value">12</span></span>
+                <input type="range" id="topk" min="3" max="20" step="1" value="12">
+              </label>
+            </div>
+          </div>
+        </div>
+      </header>
+
+      <!-- Conversation thread -->
+      <main id="thread" class="thread" aria-live="polite"></main>
+
+      <!-- Welcome / empty state (composer docks here when no conversation) -->
+      <section id="welcome" class="welcome">
+        <div class="welcome-inner">
+          <h1 id="welcome-greeting">Good afternoon</h1>
+          <p id="welcome-sub">Ask anything grounded in the documentation.</p>
+          <div id="composer-dock-welcome" class="composer-dock"></div>
+          <div id="suggestions" class="suggestions"></div>
+        </div>
+      </section>
+
+      <!-- Bottom composer dock (composer moves here once a conversation starts) -->
+      <footer id="composer-dock-bottom" class="composer-dock composer-dock-bottom"></footer>
+
+      <!-- The single composer node, relocated between docks by chat.js -->
+      <div id="composer" class="composer">
+        <div class="composer-box">
+          <textarea id="input"
+                    placeholder="Ask about the documents&hellip;"
+                    rows="1" aria-label="Question"></textarea>
+          <button id="send" type="button" class="send-btn" title="Send (Enter)" aria-label="Send">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 19V5m0 0l-6 6m6-6l6 6"/></svg>
+          </button>
+        </div>
+        <div class="composer-hint">
+          <span id="composer-grounded" class="grounded"></span>
+          <span class="hint-keys">Enter to send &middot; Shift+Enter for newline</span>
+        </div>
+        <div id="status" class="status" aria-live="polite"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============================ MODALS ============================ -->
   <!-- Upload modal -->
   <div id="upload-modal" class="modal-backdrop" hidden>
     <div class="modal" role="dialog" aria-modal="true" aria-labelledby="upload-title">
       <div class="modal-head">
-        <h3 id="upload-title">Upload a document</h3>
+        <h3 id="upload-title">Add a document to a corpus</h3>
         <button type="button" class="modal-close" id="upload-cancel" aria-label="Close">&times;</button>
       </div>
       <div class="modal-body">
+        <p class="modal-note">Permanently adds this document to the corpus and
+          reindexes it. Indexing a large PDF can take a few minutes.</p>
         <div class="form-row">
           <span>Corpus</span>
-          <div class="brand-mode">
+          <div class="corpus-mode">
             <label class="radio-row">
               <input type="radio" name="upload-corpus-mode" id="upload-corpus-mode-existing" value="existing" checked>
               <span>Existing</span>
@@ -88,23 +162,26 @@
     </div>
   </div>
 
-  <div class="workspace">
-    <aside id="history-sidebar" class="history-sidebar">
-      <div class="sidebar-head">
-        <button id="new-chat" class="new-chat-btn" type="button">+ New chat</button>
+  <!-- Supported-files help modal -->
+  <div id="help-modal" class="modal-backdrop" hidden>
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="help-title">
+      <div class="modal-head">
+        <h3 id="help-title">Supported file types</h3>
+        <button type="button" class="modal-close" id="help-cancel" aria-label="Close">&times;</button>
       </div>
-      <ul id="thread-list" class="thread-list" aria-label="Saved chat threads"></ul>
-    </aside>
-    <main id="thread" class="thread" aria-live="polite"></main>
+      <div class="modal-body">
+        <p class="modal-note">Drop any of these into a corpus via <strong>Add doc</strong>.
+          Images, archives, and other binaries are skipped automatically.</p>
+        <ul class="help-list">
+          <li><span class="help-ext">.pdf</span> &mdash; PDF documents (indexed per page)</li>
+          <li><span class="help-ext">.docx .doc</span> &mdash; Word documents</li>
+          <li><span class="help-ext">.txt .md .markdown .rst</span> &mdash; plain text / Markdown</li>
+          <li><span class="help-ext">.csv .log</span> &mdash; tabular / log text</li>
+          <li><span class="help-ext">.json .xml .html .htm</span> &mdash; structured / markup text</li>
+        </ul>
+      </div>
+    </div>
   </div>
-
-  <footer class="composer">
-    <textarea id="input"
-      placeholder="Ask something about the indexed documents. Enter sends, Shift+Enter for newline."
-      rows="2" aria-label="Question"></textarea>
-    <button id="send" type="button">Send</button>
-    <div id="status" class="status"></div>
-  </footer>
 
   <script src="/chat.js"></script>
 </body>

@@ -2,6 +2,11 @@
 .env
 app.settings.json
 
+# Scraper recon / session artifacts (cookies, login captures -- never commit)
+scraper/recon/
+**/cookies*.json
+**/login_status.json
+
 # Indexes + uploaded corpora (regenerable / large)
 .index/
 corpora/

@@ -48,6 +48,11 @@ SYSTEM_PROMPT = (
     "clearly needs more.\n"
     "6. Quote short snippets when they are diagnostic, but always cite the "
     "source chunk index with bare [N].\n"
+    "7. Chunks may come from different source documents (the document name is "
+    "shown before each excerpt). When facts come from more than one document, "
+    "name the source document for each claim. If documents conflict or one "
+    "amends or is more specific than another (e.g. a local code vs. a model "
+    "code), say so and make clear which source governs.\n"
 )
 
 USER_PROMPT_TEMPLATE = (

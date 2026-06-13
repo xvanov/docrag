@@ -44,6 +44,37 @@ python -m docrag.index purge  --corpus udo --file relative/path.pdf
 Embedding cost is roughly **$0.10 - $0.20 per ~300-page PDF**. Builds over
 $1.00 require `--confirm`.
 
+## The `building-codes` corpus (combined, multi-source)
+
+`building-codes` is a single corpus that holds building regulations from
+several jurisdictions at once, so one chat searches all of them and surfaces
+the most relevant passages regardless of source:
+
+```
+corpora/building-codes/
+  model/    2021 International Building Code (IBC)   -- the base model code
+  durham/   Durham UDO                               -- local ordinance
+  <state>/  (add state codes here, e.g. north-carolina/)
+```
+
+Retrieval (hybrid vector + BM25 RRF) ranks chunks across every document in the
+corpus, so an answer can pull from the IBC and Durham in the same response.
+Each citation `[N]` carries its own `source_file` + page, and the LLM is
+instructed to attribute each claim to its source document and to flag when a
+local code amends or is more specific than the model code.
+
+**Add another jurisdiction** (e.g. North Carolina): drop the PDF under a new
+subfolder and reindex -- unchanged files are skipped by SHA256, so only the new
+document is embedded.
+
+```powershell
+# via CLI
+copy "NC_Building_Code.pdf" corpora\building-codes\north-carolina\
+python -m docrag.index build --corpus building-codes --confirm
+
+# or via the web UI: Upload -> existing corpus "building-codes"
+```
+
 ## Chat (web UI)
 
 ```powershell

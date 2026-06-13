@@ -34,6 +34,65 @@ BM25_TOP_K = 50
 LOW_CONFIDENCE_THRESHOLD = 0.01
 
 _SHORT_CODE_RE = re.compile(r"^(?=[A-Z0-9]{2,8}$)[A-Z0-9]*[A-Z][A-Z0-9]*$")
+
+# Map a chunk's relative path to a jurisdiction bucket (building-codes corpus:
+# model IBC vs. NC state code vs. Durham local ordinance).
+_JURISDICTIONS = (
+    ("north-carolina/", "north-carolina"),
+    ("model/", "model"),
+    ("durham/", "durham"),
+)
+
+
+def _jurisdiction(path: str) -> str:
+    p = (path or "").replace("\\", "/").lstrip("/")
+    for prefix, name in _JURISDICTIONS:
+        if p.startswith(prefix):
+            return name
+    return p.split("/", 1)[0] if "/" in p else "_root"
+
+
+def _balance_by_jurisdiction(results: list[dict], top_k: int) -> list[dict]:
+    """Round-robin interleave RRF-ordered results across jurisdictions so a
+    multi-source corpus surfaces every jurisdiction that has hits, instead of
+    letting one code dominate the top_k. Rank order is preserved within each
+    bucket; buckets are visited in order of their best (first) result."""
+    buckets: dict[str, list[dict]] = {}
+    for r in results:
+        buckets.setdefault(_jurisdiction(r.get("path")), []).append(r)
+    if len(buckets) <= 1:
+        return results[:top_k]
+    order = sorted(buckets, key=lambda k: results.index(buckets[k][0]))
+    out: list[dict] = []
+    i = 0
+    while len(out) < top_k and any(buckets[k] for k in order):
+        b = buckets[order[i % len(order)]]
+        if b:
+            out.append(b.pop(0))
+        i += 1
+    return out
+
+
+# When one jurisdiction holds this share of the top window, the question is
+# jurisdiction-specific (e.g. an NC permit rule) and balancing would only
+# dilute it -- so plain RRF is kept instead of interleaving.
+_DOMINANCE_FRAC = 0.6
+
+
+def _jurisdiction_dominated(results: list[dict], window: int,
+                            frac: float = _DOMINANCE_FRAC) -> bool:
+    """True if a single jurisdiction owns >= ``frac`` of the top ``window``
+    RRF results (or only one jurisdiction is present at all)."""
+    top = results[:window]
+    if not top:
+        return True
+    counts: dict[str, int] = {}
+    for r in top:
+        j = _jurisdiction(r.get("path"))
+        counts[j] = counts.get(j, 0) + 1
+    if len(counts) <= 1:
+        return True
+    return max(counts.values()) / len(top) >= frac
 # FTS5 syntax characters we strip to keep the query a plain token bag.
 _FTS_SYNTAX_RE = re.compile(r'[\"\(\)\*\:\^]')
 
@@ -77,8 +136,12 @@ def _row_to_chunk(row: dict, score: float) -> dict:
 
 
 def rag_query(corpus: str, query: str, top_k: int = 12,
-              filters: dict | None = None) -> dict:
-    """Hybrid retrieve top_k chunks for ``query`` from ``corpus``."""
+              filters: dict | None = None, balance: bool = False) -> dict:
+    """Hybrid retrieve top_k chunks for ``query`` from ``corpus``.
+
+    ``balance=True`` interleaves results across jurisdiction buckets (model /
+    north-carolina / durham) so a cross-code question draws from all sources.
+    """
     query = (query or "").strip()
     if not query:
         return {"status": "no_results", "results": []}
@@ -162,8 +225,14 @@ def rag_query(corpus: str, query: str, top_k: int = 12,
             return {"status": "no_results", "results": []}
 
         top_score = results[0]["score"]
-        results = results[:top_k]
+        # Adaptive balancing: only interleave across jurisdictions when no
+        # single one dominates the top hits. A jurisdiction-specific question
+        # (e.g. an NC permit threshold) keeps plain RRF so its best chunks
+        # aren't crowded out by forced cross-jurisdiction slots.
+        applied = bool(balance) and not _jurisdiction_dominated(results, max(top_k, 10))
+        results = (_balance_by_jurisdiction(results, top_k) if applied
+                   else results[:top_k])
         status = "low_confidence" if top_score < LOW_CONFIDENCE_THRESHOLD else "ok"
-        return {"status": status, "results": results}
+        return {"status": status, "results": results, "balanced": applied}
     finally:
         conn.close()

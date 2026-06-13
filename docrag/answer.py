@@ -55,6 +55,18 @@ SYSTEM_PROMPT = (
     "code), say so and make clear which source governs.\n"
 )
 
+# Extra guidance when balanced retrieval spans the three building-code
+# jurisdictions, so the answer synthesizes across all of them.
+CROSS_JURISDICTION_NOTE = (
+    "\nThese excerpts span three layers of building regulation: the model "
+    "International Code (IBC), the North Carolina state amendments (NC 2024 "
+    "codes), and the Durham UDO (local ordinance). When the question touches "
+    "all three, structure the answer as: the model/baseline requirement, then "
+    "how North Carolina amends or adopts it, then any Durham-specific local "
+    "rule -- and state which one governs in Durham, North Carolina. Cite each "
+    "layer. If a layer is silent on the topic, say so rather than inferring.\n"
+)
+
 USER_PROMPT_TEMPLATE = (
     "Question / topic: {query}\n\n"
     "Chunks (numbered):\n{chunks_block}\n\n"
@@ -173,28 +185,38 @@ def _refused(chunks, reason, status):
 
 
 def answer(corpus: str, query: str, history: list[dict] | None = None,
-           top_k: int = 12, filters: dict | None = None) -> dict:
+           top_k: int = 12, filters: dict | None = None,
+           balance: bool = False) -> dict:
     """Retrieve + synthesize a grounded, cited answer.
+
+    ``balance=True`` enables jurisdiction-balanced retrieval + cross-code
+    synthesis guidance (model IBC / NC state / Durham UDO).
 
     Returns ``{answer, citations, chunks, refused, refusal_reason, status,
     tokens}``.
     """
-    retrieval = rag_query(corpus, query, top_k=top_k, filters=filters)
+    retrieval = rag_query(corpus, query, top_k=top_k, filters=filters,
+                          balance=balance)
     chunks = retrieval.get("results") or []
     r_status = retrieval.get("status")
+    # Balancing is adaptive: rag_query may decline to interleave when one
+    # jurisdiction dominates. Key the cross-jurisdiction synthesis note off
+    # what was actually applied, not what was requested.
+    applied_balance = bool(retrieval.get("balanced"))
 
     if r_status == "no_results" or not chunks:
         return _refused(chunks, "no_supporting_documentation", "no_results")
     if r_status == "low_confidence":
         return _refused(chunks, "low_confidence", "refused")
 
+    system_prompt = SYSTEM_PROMPT + (CROSS_JURISDICTION_NOTE if applied_balance else "")
     chunks_block = _build_chunks_block(chunks)
     user_prompt = USER_PROMPT_TEMPLATE.format(query=query, chunks_block=chunks_block)
 
     global _LAST_PROMPT
-    _LAST_PROMPT = {"system": SYSTEM_PROMPT, "user": user_prompt}
+    _LAST_PROMPT = {"system": system_prompt, "user": user_prompt}
 
-    messages: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}]
+    messages: list[dict] = [{"role": "system", "content": system_prompt}]
     if history:
         for turn in history:
             role = turn.get("role")
@@ -231,4 +253,4 @@ def answer(corpus: str, query: str, history: list[dict] | None = None,
 
     return {"answer": answer_text, "citations": citations, "chunks": chunks,
             "refused": False, "refusal_reason": None, "status": "ok",
-            "tokens": tokens}
+            "tokens": tokens, "balanced": applied_balance}

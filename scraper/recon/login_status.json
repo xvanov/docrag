@@ -1,0 +1,4 @@
+{
+  "status": 403,
+  "body": "{\"error\":\"Authentication required\"}"
+}

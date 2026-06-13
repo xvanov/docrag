@@ -13,6 +13,7 @@ Public API:
 from __future__ import annotations
 
 import os
+import re
 import sys
 from typing import Iterator
 
@@ -20,9 +21,12 @@ from . import settings
 from .extractors import (
     extract_doc,
     extract_docx,
+    extract_html,
     extract_pdf_pages,
     sanitize_ascii,
 )
+
+_EXT_HTML = frozenset({".html", ".htm"})
 
 
 # Extensions we know how to read.
@@ -62,7 +66,9 @@ def _walk(corpus: str) -> Iterator[str]:
     for dirpath, dirnames, filenames in os.walk(_safe_path(root)):
         dirnames[:] = [d for d in dirnames if not d.startswith(".")]
         for name in filenames:
-            if name.startswith("."):
+            # Skip hidden files and "_"-prefixed internal sidecars
+            # (e.g. the scraper's _toc.json / _manifest.json / _coverage.json).
+            if name.startswith(".") or name.startswith("_"):
                 continue
             yield os.path.join(dirpath, name)
 
@@ -138,19 +144,65 @@ def _read_text_file(abs_path: str) -> str:
         return ""
 
 
+def _nc_source_label(book: str) -> str:
+    """'2024 North Carolina State Building Code: Building Code' -> 'NC 2024 Building Code'."""
+    if "North Carolina State Building Code" in book and ":" in book:
+        suffix = book.split(":", 1)[1].strip()
+        return "NC 2024 " + suffix
+    return book
+
+
 def extract_file(file_entry: dict) -> dict:
     """Extract text from one eligible file.
 
     Returns: ``{"kind": "pdf"|"text", "pages": list[str]|None,
-                "text": str|None, "page_count": int, "no_text": bool}``.
+                "text": str|None, "page_count": int, "no_text": bool,
+                "source_label": str|None, "section_label": str|None}``.
     PDFs return per-page text; everything else a single text blob.
+    ``source_label`` / ``section_label`` (HTML codes only) drive jurisdiction-
+    aware citations; None means "fall back to the file basename".
     """
     abs_path = file_entry["abs_path"]
     ext = file_entry["ext"]
     safe_abs = _safe_path(abs_path)
 
     result: dict = {"kind": "text", "pages": None, "text": None,
-                    "page_count": 0, "no_text": False}
+                    "page_count": 0, "no_text": False,
+                    "source_label": None, "section_label": None,
+                    "sections": None, "book": None}
+
+    if ext in _EXT_HTML:
+        try:
+            parsed = extract_html(safe_abs)
+        except RuntimeError as e:
+            sys.stderr.write("[extract] %s: %s\n" % (file_entry["path"], e))
+            parsed = {"flat_text": "", "book": "", "chapter": "", "sections": []}
+        book = parsed.get("book") or ""
+        chapter = parsed.get("chapter") or ""
+        if book:
+            result["source_label"] = sanitize_ascii(_nc_source_label(book))
+            result["book"] = book
+        if chapter:
+            result["section_label"] = sanitize_ascii(chapter)
+        sections = parsed.get("sections") or []
+        if sections:
+            # Structured path: sanitize each section's text fields.
+            for s in sections:
+                s["own_text"] = sanitize_ascii(s.get("own_text") or "")
+                s["full_text"] = sanitize_ascii(s.get("full_text") or "")
+                s["section_title"] = sanitize_ascii(s.get("section_title") or "") or None
+            result["kind"] = "html_sections"
+            result["sections"] = sections
+            total = sum(len(s["own_text"]) for s in sections)
+            result["page_count"] = 1 if total else 0
+            result["no_text"] = total == 0
+            return result
+        # Fallback: flat text -> sliding-window chunking.
+        text = sanitize_ascii(parsed.get("flat_text") or "")
+        result["text"] = text
+        result["page_count"] = 1 if text.strip() else 0
+        result["no_text"] = not text.strip()
+        return result
 
     if ext == _EXT_PDF:
         page_tuples = extract_pdf_pages(safe_abs) or []

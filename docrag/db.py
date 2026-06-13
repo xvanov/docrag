@@ -2,12 +2,22 @@
 
 One DB file per corpus: ``{index_dir}/{corpus}.db``.
 
-  files       (path, sha256, size, indexed_at)
-  chunks      (id, path, corpus, source_file, kind, page,
-               start_line, end_line, text, context_summary,
-               content_hash, indexed_at)
-  vec_chunks  (chunk_id, embedding[D])      -- sqlite-vec virtual
-  fts_chunks  (text, source_file, kind)     -- FTS5 virtual, content='chunks'
+  files        (path, sha256, size, indexed_at)
+  chunks       (id, path, corpus, source_file, kind, page, start_line,
+                end_line, text, context_summary, content_hash, indexed_at,
+                + section_id, section_number, section_title, breadcrumb,
+                jurisdiction, edition, parent_section_id, node_type)
+               -- one row per *embedded leaf* (smallest section body or a
+               -- table or a sliding-window fallback span)
+  section_nodes(id, corpus, path, jurisdiction, edition, section_id,
+                section_number, section_title, breadcrumb,
+                parent_section_id, full_text)
+               -- the parent-document payload: one row per section, full_text
+               -- = own body + all descendant bodies. NOT embedded.
+  section_refs (src_section_id, dst_raw, dst_kind, dst_section_id, corpus)
+               -- citation graph: cross-references parsed from section text.
+  vec_chunks   (chunk_id, embedding[D])      -- sqlite-vec virtual, leaves only
+  fts_chunks   (text, meta, source_file, kind) -- FTS5, standalone, leaves only
 
 The only module that talks to SQLite.
 
@@ -31,6 +41,9 @@ from typing import Iterable
 import sqlite_vec
 
 from . import settings
+
+# Bump when the schema changes in a way that requires a full rebuild.
+SCHEMA_VERSION = 2
 
 # Corpus names map directly to filesystem paths ({index_dir}/{corpus}.db).
 _CORPUS_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
@@ -69,6 +82,12 @@ def open_db(corpus: str, db_path: str | os.PathLike | None = None) -> sqlite3.Co
     return conn
 
 
+def schema_outdated(conn: sqlite3.Connection) -> bool:
+    """True if this DB predates the current SCHEMA_VERSION (needs --full rebuild)."""
+    row = conn.execute("PRAGMA user_version").fetchone()
+    return (row[0] if row else 0) < SCHEMA_VERSION
+
+
 def _ensure_schema(conn: sqlite3.Connection) -> None:
     dims = embedding_dims()
     cur = conn.cursor()
@@ -93,26 +112,65 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
       context_summary TEXT,
       content_hash TEXT NOT NULL,
       indexed_at INTEGER NOT NULL,
+      section_id TEXT,
+      section_number TEXT,
+      section_title TEXT,
+      breadcrumb TEXT,
+      jurisdiction TEXT,
+      edition TEXT,
+      parent_section_id TEXT,
+      node_type TEXT NOT NULL DEFAULT 'leaf',
       FOREIGN KEY(path) REFERENCES files(path) ON DELETE CASCADE
     );
 
     CREATE INDEX IF NOT EXISTS idx_chunks_path   ON chunks(path);
     CREATE INDEX IF NOT EXISTS idx_chunks_corpus ON chunks(corpus);
+
+    CREATE TABLE IF NOT EXISTS section_nodes (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      corpus TEXT NOT NULL,
+      path TEXT NOT NULL,
+      jurisdiction TEXT,
+      edition TEXT,
+      section_id TEXT NOT NULL,
+      section_number TEXT,
+      section_title TEXT,
+      breadcrumb TEXT,
+      parent_section_id TEXT,
+      full_text TEXT NOT NULL,
+      indexed_at INTEGER NOT NULL,
+      UNIQUE(corpus, section_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_section_nodes_path ON section_nodes(path);
+
+    CREATE TABLE IF NOT EXISTS section_refs (
+      src_section_id TEXT NOT NULL,
+      dst_raw TEXT NOT NULL,
+      dst_kind TEXT,
+      dst_section_id TEXT,
+      corpus TEXT NOT NULL,
+      path TEXT NOT NULL,
+      PRIMARY KEY(src_section_id, dst_raw)
+    );
+    CREATE INDEX IF NOT EXISTS idx_section_refs_src  ON section_refs(src_section_id);
+    CREATE INDEX IF NOT EXISTS idx_section_refs_path ON section_refs(path);
     """)
 
     cur.execute(
         "CREATE VIRTUAL TABLE IF NOT EXISTS vec_chunks USING vec0("
         "chunk_id INTEGER PRIMARY KEY, embedding FLOAT[%d])" % dims
     )
+    # Standalone FTS (not external-content): body in `text`, enrichment in
+    # `meta`, so BM25 can weight them separately (see query.py bm25 weights).
     cur.execute("""
     CREATE VIRTUAL TABLE IF NOT EXISTS fts_chunks USING fts5(
       text,
+      meta,
       source_file UNINDEXED,
-      kind UNINDEXED,
-      content='chunks',
-      content_rowid='id'
+      kind UNINDEXED
     );
     """)
+    conn.execute("PRAGMA user_version=%d" % SCHEMA_VERSION)
     conn.commit()
 
 
@@ -137,7 +195,7 @@ def upsert_file(conn: sqlite3.Connection, path: str, sha256: str, size: int) -> 
 
 
 def purge_file(conn: sqlite3.Connection, path: str) -> None:
-    """Delete chunks + vec + fts rows for this path, then the files row."""
+    """Delete chunks + vec + fts + section rows for this path, then files row."""
     cur = conn.cursor()
     cur.execute("SELECT id FROM chunks WHERE path=?", (path,))
     ids = [r[0] for r in cur.fetchall()]
@@ -147,6 +205,8 @@ def purge_file(conn: sqlite3.Connection, path: str) -> None:
         cur.execute("DELETE FROM vec_chunks WHERE chunk_id IN (%s)" % ph, batch)
         cur.execute("DELETE FROM fts_chunks WHERE rowid IN (%s)" % ph, batch)
     cur.execute("DELETE FROM chunks WHERE path=?", (path,))
+    cur.execute("DELETE FROM section_nodes WHERE path=?", (path,))
+    cur.execute("DELETE FROM section_refs WHERE path=?", (path,))
     cur.execute("DELETE FROM files WHERE path=?", (path,))
 
 
@@ -160,7 +220,7 @@ def insert_chunks(
     chunks: list[dict],
     embeddings: list[list[float]],
 ) -> list[int]:
-    """Insert chunks + embeddings + fts rows. Returns ids. Does NOT commit."""
+    """Insert leaf chunks + embeddings + fts rows. Returns ids. No commit."""
     if len(chunks) != len(embeddings):
         raise ValueError(
             "chunks/embeddings length mismatch: %d vs %d"
@@ -179,13 +239,19 @@ def insert_chunks(
         cur.execute(
             "INSERT INTO chunks(path, corpus, source_file, kind, page, "
             "start_line, end_line, text, context_summary, content_hash, "
-            "indexed_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "indexed_at, section_id, section_number, section_title, "
+            "breadcrumb, jurisdiction, edition, parent_section_id, node_type) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 ch["path"], ch["corpus"], ch["source_file"],
                 ch.get("kind", "document"), ch.get("page"),
                 ch.get("start_line"), ch.get("end_line"),
                 ch["text"], ch.get("context_summary"),
                 ch["content_hash"], now,
+                ch.get("section_id"), ch.get("section_number"),
+                ch.get("section_title"), ch.get("breadcrumb"),
+                ch.get("jurisdiction"), ch.get("edition"),
+                ch.get("parent_section_id"), ch.get("node_type", "leaf"),
             ),
         )
         chunk_id = cur.lastrowid
@@ -195,11 +261,69 @@ def insert_chunks(
             (chunk_id, _pack_vec(vec)),
         )
         cur.execute(
-            "INSERT INTO fts_chunks(rowid, text, source_file, kind) "
-            "VALUES(?, ?, ?, ?)",
-            (chunk_id, ch["text"], ch["source_file"], ch.get("kind", "document")),
+            "INSERT INTO fts_chunks(rowid, text, meta, source_file, kind) "
+            "VALUES(?, ?, ?, ?, ?)",
+            (chunk_id, ch["text"], ch.get("meta") or "",
+             ch["source_file"], ch.get("kind", "document")),
         )
     return inserted
+
+
+def insert_section_nodes(conn: sqlite3.Connection, nodes: list[dict]) -> None:
+    """Insert-or-replace parent-document section rows. No commit."""
+    now = int(time.time())
+    cur = conn.cursor()
+    for n in nodes:
+        cur.execute(
+            "INSERT OR REPLACE INTO section_nodes(corpus, path, jurisdiction, "
+            "edition, section_id, section_number, section_title, breadcrumb, "
+            "parent_section_id, full_text, indexed_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                n["corpus"], n["path"], n.get("jurisdiction"), n.get("edition"),
+                n["section_id"], n.get("section_number"), n.get("section_title"),
+                n.get("breadcrumb"), n.get("parent_section_id"),
+                n.get("full_text") or "", now,
+            ),
+        )
+
+
+def insert_section_refs(conn: sqlite3.Connection, refs: list[dict]) -> None:
+    """Insert citation-graph edges. No commit."""
+    cur = conn.cursor()
+    for r in refs:
+        cur.execute(
+            "INSERT OR REPLACE INTO section_refs(src_section_id, dst_raw, "
+            "dst_kind, dst_section_id, corpus, path) VALUES(?,?,?,?,?,?)",
+            (r["src_section_id"], r["dst_raw"], r.get("dst_kind"),
+             r.get("dst_section_id"), r["corpus"], r["path"]),
+        )
+
+
+def get_section(conn: sqlite3.Connection, corpus: str, section_id: str) -> dict | None:
+    """Fetch one section_nodes row by (corpus, section_id) as a dict."""
+    cur = conn.execute(
+        "SELECT corpus, path, jurisdiction, edition, section_id, "
+        "section_number, section_title, breadcrumb, parent_section_id, "
+        "full_text FROM section_nodes WHERE corpus=? AND section_id=?",
+        (corpus, section_id),
+    )
+    row = cur.fetchone()
+    if not row:
+        return None
+    cols = [d[0] for d in cur.description]
+    return dict(zip(cols, row))
+
+
+def get_refs(conn: sqlite3.Connection, src_section_id: str) -> list[dict]:
+    """Resolved outgoing citation edges for a section (dst_section_id NOT NULL)."""
+    cur = conn.execute(
+        "SELECT dst_raw, dst_kind, dst_section_id FROM section_refs "
+        "WHERE src_section_id=? AND dst_section_id IS NOT NULL",
+        (src_section_id,),
+    )
+    cols = [d[0] for d in cur.description]
+    return [dict(zip(cols, r)) for r in cur.fetchall()]
 
 
 def stats(conn: sqlite3.Connection, corpus: str) -> dict:
@@ -209,6 +333,12 @@ def stats(conn: sqlite3.Connection, corpus: str) -> dict:
     ).fetchone()[0]
     vec_count = conn.execute("SELECT COUNT(*) FROM vec_chunks").fetchone()[0]
     fts_count = conn.execute("SELECT COUNT(*) FROM fts_chunks").fetchone()[0]
+    section_count = conn.execute(
+        "SELECT COUNT(*) FROM section_nodes WHERE corpus=?", (corpus,)
+    ).fetchone()[0]
+    ref_count = conn.execute(
+        "SELECT COUNT(*) FROM section_refs WHERE corpus=?", (corpus,)
+    ).fetchone()[0]
 
     db_path = None
     for row in conn.execute("PRAGMA database_list"):
@@ -222,6 +352,8 @@ def stats(conn: sqlite3.Connection, corpus: str) -> dict:
         "chunk_count": int(chunk_count),
         "vec_count": int(vec_count),
         "fts_count": int(fts_count),
+        "section_count": int(section_count),
+        "ref_count": int(ref_count),
         "db_size_bytes": int(db_size),
     }
 
@@ -254,26 +386,49 @@ def _self_test() -> int:
     dims = embedding_dims()
     conn = open_db(corpus, db_path=tmp)
     try:
-        upsert_file(conn, "doc.pdf", "deadbeef" * 8, 12345)
-        assert file_row(conn, "doc.pdf") == ("deadbeef" * 8, 12345)
+        upsert_file(conn, "doc.html", "deadbeef" * 8, 12345)
+        assert file_row(conn, "doc.html") == ("deadbeef" * 8, 12345)
         rng = random.Random(1337)
         chunk_dicts = [
-            {"path": "doc.pdf", "corpus": corpus, "source_file": "doc.pdf",
-             "kind": "document", "page": 1, "text": "alpha bravo charlie",
-             "context_summary": "p1", "content_hash": "h1"},
-            {"path": "doc.pdf", "corpus": corpus, "source_file": "doc.pdf",
-             "kind": "document", "page": 2, "text": "delta echo RX304 foxtrot",
-             "context_summary": "p2", "content_hash": "h2"},
+            {"path": "doc.html", "corpus": corpus, "source_file": "NC 2024 Building Code",
+             "kind": "document", "page": None, "text": "alpha bravo charlie",
+             "meta": "R101.1 Title", "context_summary": "c1", "content_hash": "h1",
+             "section_id": "Sec101.1", "section_number": "101.1",
+             "section_title": "Title", "breadcrumb": "Ch1 > 101 > 101.1",
+             "jurisdiction": "north-carolina", "edition": "NC 2024",
+             "parent_section_id": "Sec101", "node_type": "leaf"},
+            {"path": "doc.html", "corpus": corpus, "source_file": "NC 2024 Building Code",
+             "kind": "document", "page": None, "text": "delta echo RX304 foxtrot",
+             "meta": "101.2 Scope", "context_summary": "c2", "content_hash": "h2",
+             "section_id": "Sec101.2", "section_number": "101.2",
+             "section_title": "Scope", "breadcrumb": "Ch1 > 101 > 101.2",
+             "jurisdiction": "north-carolina", "edition": "NC 2024",
+             "parent_section_id": "Sec101", "node_type": "leaf"},
         ]
         embs = [[rng.uniform(-1, 1) for _ in range(dims)] for _ in chunk_dicts]
         ids = insert_chunks(conn, chunk_dicts, embs)
         assert len(ids) == 2
+
+        insert_section_nodes(conn, [{
+            "corpus": corpus, "path": "doc.html", "jurisdiction": "north-carolina",
+            "edition": "NC 2024", "section_id": "Sec101", "section_number": "101",
+            "section_title": "General", "breadcrumb": "Ch1 > 101",
+            "parent_section_id": "Ch1",
+            "full_text": "alpha bravo charlie delta echo RX304 foxtrot"}])
+        insert_section_refs(conn, [{
+            "src_section_id": "Sec101.2", "dst_raw": "160D-1110",
+            "dst_kind": "ncgs", "dst_section_id": "SecNCGS", "corpus": corpus,
+            "path": "doc.html"}])
         conn.commit()
 
         s = stats(conn, corpus)
-        assert s == {**s, "file_count": 1, "chunk_count": 2,
-                     "vec_count": 2, "fts_count": 2}, s
-        assert s["db_size_bytes"] > 0
+        assert s["chunk_count"] == 2 and s["vec_count"] == 2 and s["fts_count"] == 2, s
+        assert s["section_count"] == 1 and s["ref_count"] == 1, s
+
+        parent = get_section(conn, corpus, "Sec101")
+        assert parent and "RX304" in parent["full_text"], parent
+        refs = get_refs(conn, "Sec101.2")
+        assert refs and refs[0]["dst_raw"] == "160D-1110", refs
 
         probe = _pack_vec(embs[0])
         vec_rows = conn.execute(
@@ -287,10 +442,17 @@ def _self_test() -> int:
         ).fetchall()
         assert ids[1] in {r[0] for r in fts_rows}, fts_rows
 
-        purge_file(conn, "doc.pdf")
+        # meta column is searchable too (section number match).
+        meta_rows = conn.execute(
+            "SELECT rowid FROM fts_chunks WHERE fts_chunks MATCH ?", ("meta:Scope",),
+        ).fetchall()
+        assert ids[1] in {r[0] for r in meta_rows}, meta_rows
+
+        purge_file(conn, "doc.html")
         conn.commit()
         s2 = stats(conn, corpus)
-        for k in ("file_count", "chunk_count", "vec_count", "fts_count"):
+        for k in ("file_count", "chunk_count", "vec_count", "fts_count",
+                  "section_count", "ref_count"):
             assert s2[k] == 0, (k, s2[k])
     finally:
         conn.close()

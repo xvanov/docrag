@@ -402,6 +402,11 @@ body.is-welcome #composer-dock-welcome { margin-top: 8px; }
 .source-head .filename { font-weight: 600; color: var(--text); }
 .source-head a.filename:hover { color: var(--accent-2); }
 .source-meta { color: var(--text-mute); font-family: var(--mono); font-size: 11px; }
+.src-section { font-size: 11.5px; color: var(--accent-2); font-weight: 600; }
+.src-ref-badge {
+  font-size: 10.5px; font-weight: 600; color: #c79be8;
+  background: rgba(170,120,220,.16); border-radius: 5px; padding: 1px 6px;
+}
 .page-link { color: var(--accent-2); }
 .rate { margin-left: auto; display: inline-flex; gap: 4px; }
 .rate button {
@@ -496,3 +501,40 @@ body.is-welcome #composer-dock-welcome { margin-top: 8px; }
   .topbar-actions .action-btn span { display: none; }
   .action-btn { padding: 0 9px; }
 }
+
+/* ---------- Location selector (global) ---------- */
+.location-picker {
+  display: inline-flex; align-items: center; gap: 6px;
+  margin-left: 10px; padding: 5px 8px;
+  background: var(--panel); border: 1px solid var(--border);
+  border-radius: var(--radius-sm); color: var(--text-dim);
+}
+.location-picker .loc-icon {
+  width: 15px; height: 15px; fill: none;
+  stroke: var(--accent); stroke-width: 1.8;
+  stroke-linecap: round; stroke-linejoin: round;
+}
+#location-select {
+  background: transparent; border: none; color: var(--text);
+  font: inherit; font-size: 13px; cursor: pointer; outline: none;
+  max-width: 200px;
+}
+#location-select option { background: var(--panel); color: var(--text); }
+
+/* ---------- Per-document version (edition) selectors ---------- */
+.versions-section {
+  margin-top: 10px; padding-top: 10px;
+  border-top: 1px solid var(--border-soft);
+}
+.versions-list { list-style: none; margin: 6px 0 0; padding: 0; }
+.version-item {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 10px; padding: 5px 2px;
+}
+.version-doc { color: var(--text-dim); font-size: 13px; }
+.version-select {
+  background: var(--bg); color: var(--text);
+  border: 1px solid var(--border); border-radius: 8px;
+  padding: 3px 6px; font: inherit; font-size: 12px; cursor: pointer;
+}
+.version-select option { background: var(--panel); color: var(--text); }

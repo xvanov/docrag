@@ -41,7 +41,21 @@
     activeThreadId: null,
     pickerOpen: false,
     hoverIdx: -1,
+    location: "",        // selected location key (global)
+    versions: {},        // per-document edition overrides {doc_key: year}
+    versionDocs: [],      // versionable documents from /api/facets
   };
+
+  var LS_LOCATION = "docrag.location";
+  var LS_VERSIONS = "docrag.versions";
+
+  function loadLocalJson(key, fallback) {
+    try { var v = localStorage.getItem(key); return v ? JSON.parse(v) : fallback; }
+    catch (e) { return fallback; }
+  }
+  function saveLocal(key, val) {
+    try { localStorage.setItem(key, JSON.stringify(val)); } catch (e) {}
+  }
 
   var els = {
     thread: document.getElementById("thread"),
@@ -93,6 +107,10 @@
     composerDockWelcome: document.getElementById("composer-dock-welcome"),
     composerDockBottom: document.getElementById("composer-dock-bottom"),
     composerGrounded: document.getElementById("composer-grounded"),
+    // Location + version selectors
+    locationSelect: document.getElementById("location-select"),
+    versionsSection: document.getElementById("versions-section"),
+    versionsList: document.getElementById("versions-list"),
   };
 
   // ---------- Utils ----------
@@ -390,6 +408,61 @@
     renderPickerButton();
   }
 
+  function renderVersionsList() {
+    if (!els.versionsList || !els.versionsSection) return;
+    els.versionsList.innerHTML = "";
+    var versioned = (state.versionDocs || []).filter(function (d) { return d.versioned; });
+    if (!versioned.length) { els.versionsSection.hidden = true; return; }
+    els.versionsSection.hidden = false;
+    versioned.forEach(function (d) {
+      var sel = el("select", { className: "version-select",
+        attrs: { "data-doc": d.doc_key, "aria-label": d.doc_label + " edition" } });
+      var chosen = state.versions[d.doc_key] || d.default_year;
+      d.years.forEach(function (y) {
+        var o = el("option", { text: y, attrs: { value: y } });
+        if (String(y) === String(chosen)) o.selected = true;
+        sel.appendChild(o);
+      });
+      sel.addEventListener("change", function () {
+        state.versions[d.doc_key] = sel.value;
+        saveLocal(LS_VERSIONS, state.versions);
+      });
+      els.versionsList.appendChild(el("li", { className: "version-item" }, [
+        el("span", { className: "version-doc", text: d.doc_label }),
+        sel,
+      ]));
+    });
+  }
+
+  function renderLocationSelect() {
+    if (!els.locationSelect) return;
+    var locs = state.locations || [];
+    els.locationSelect.innerHTML = "";
+    locs.forEach(function (loc) {
+      var o = el("option", { text: loc.label, attrs: { value: loc.key } });
+      if (loc.key === state.location) o.selected = true;
+      els.locationSelect.appendChild(o);
+    });
+  }
+
+  async function loadFacets() {
+    try {
+      var url = "/api/facets" + (state.corpus ? "?corpus=" + encodeURIComponent(state.corpus) : "");
+      var r = await fetch(url);
+      if (!r.ok) return;
+      var data = await r.json();
+      state.locations = data.locations || [];
+      state.versionDocs = data.versions || [];
+      // Restore persisted selections; default location from server.
+      var savedLoc = loadLocalJson(LS_LOCATION, "");
+      var valid = state.locations.some(function (l) { return l.key === savedLoc; });
+      state.location = valid ? savedLoc : (data.default_location || (state.locations[0] || {}).key || "");
+      state.versions = loadLocalJson(LS_VERSIONS, {}) || {};
+      renderLocationSelect();
+      renderVersionsList();
+    } catch (e) { console.warn("facets load failed", e); }
+  }
+
   async function loadCorpora() {
     try {
       var r = await fetch("/api/corpora");
@@ -412,6 +485,7 @@
       state.corpus = primary;
       renderPickerButton();
       loadSources();
+      loadFacets();
     } catch (e) {
       setStatus("corpus load failed");
       console.error(e);
@@ -545,13 +619,25 @@
     var meta = el("span", { className: "source-meta" },
       [pageEl, el("span", { text: "  kind=" + kind + "  score=" + score })]);
 
+    var sectionEl = null;
+    if (chunk.section_number) {
+      var secTxt = "§ " + chunk.section_number +
+        (chunk.section_title ? " " + chunk.section_title : "");
+      sectionEl = el("span", { className: "src-section", text: secTxt });
+    }
+    var refBadge = chunk.referenced
+      ? el("span", { className: "src-ref-badge",
+          text: "cross-ref" + (chunk.referenced_by ? " ← " + chunk.referenced_by : "") })
+      : null;
+
     var rateGood = el("button", {
       attrs: { type: "button", title: "Mark helpful. Click again to clear.", "data-rating": "good" }, text: "+" });
     var rateBad = el("button", {
       attrs: { type: "button", title: "Mark wrong. Click again to clear.", "data-rating": "bad" }, text: "-" });
     var rate = el("span", { className: "rate" }, [rateGood, rateBad]);
 
-    var head = el("div", { className: "source-head" }, [idxBadge, fnameSpan, meta, rate]);
+    var head = el("div", { className: "source-head" },
+      [idxBadge, fnameSpan, sectionEl, refBadge, meta, rate]);
     var previewEl = el("div", { className: "preview", text: preview });
     var card = el("div", {
       className: "source-card",
@@ -771,7 +857,8 @@
       var r = await fetch("/api/chat", {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ corpus: corpus, query: query,
-          history: historyForServer, sources_only: sourcesOnly, top_k: topK }),
+          history: historyForServer, sources_only: sourcesOnly, top_k: topK,
+          location: state.location || undefined, versions: state.versions || {} }),
       });
       var data;
       try { data = await r.json(); }
@@ -976,6 +1063,13 @@
     });
     document.addEventListener("keydown", function (ev) {
       if (ev.key === "Escape" && !els.helpModal.hidden) els.helpModal.hidden = true;
+    });
+  }
+
+  if (els.locationSelect) {
+    els.locationSelect.addEventListener("change", function () {
+      state.location = els.locationSelect.value;
+      saveLocal(LS_LOCATION, state.location);
     });
   }
 

@@ -54,9 +54,18 @@
                  aria-label="Sources searched" hidden>
               <div class="sources-menu-head">Every answer searches all of these:</div>
               <ul id="sources-list" class="sources-menu-list"></ul>
+              <div id="versions-section" class="versions-section" hidden>
+                <div class="sources-menu-head">Edition (version) per code</div>
+                <ul id="versions-list" class="versions-list"></ul>
+              </div>
             </div>
             <select id="corpus-select" class="corpus-select-hidden" aria-hidden="true" tabindex="-1"></select>
           </div>
+
+          <label class="location-picker" title="Jurisdiction stack applied to every answer (model code + state + local).">
+            <svg class="loc-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 21s-6-5.3-6-10a6 6 0 1112 0c0 4.7-6 10-6 10z"/><circle cx="12" cy="11" r="2.2"/></svg>
+            <select id="location-select" aria-label="Location"></select>
+          </label>
         </div>
 
         <div class="topbar-actions">

@@ -48,6 +48,7 @@ import traceback
 import urllib.parse
 
 from docrag import settings
+from docrag import facets
 from docrag.answer import answer as rag_answer_call
 from docrag.query import rag_query
 from docrag.db import open_db, valid_corpus
@@ -383,6 +384,8 @@ class DocRagHandler(http.server.BaseHTTPRequestHandler):
             self._handle_corpora()
         elif path == "/api/sources":
             self._handle_sources(urllib.parse.parse_qs(parsed.query))
+        elif path == "/api/facets":
+            self._handle_facets(urllib.parse.parse_qs(parsed.query))
         elif path == "/api/health":
             self._send_json({"ok": True, "ts": _now_iso_utc()})
         elif path == "/source":
@@ -438,6 +441,37 @@ class DocRagHandler(http.server.BaseHTTPRequestHandler):
             return
         self._send_json({"corpus": corpus, "sources": sources})
 
+    def _handle_facets(self, qs):
+        """Location options (static) + per-document version options (from the
+        index) for the selectors. Versionless / empty corpora still return the
+        location list so the global selector always works."""
+        raw_corpus = (qs.get("corpus") or [""])[0] or _primary_corpus()
+        out = {
+            "locations": [{"key": loc["key"], "label": loc["label"]}
+                          for loc in facets.LOCATIONS],
+            "default_location": facets.DEFAULT_LOCATION,
+            "versions": [],
+            "corpus": "",
+        }
+        if not raw_corpus:
+            self._send_json(out)
+            return
+        try:
+            corpus = _validate_corpus(raw_corpus)
+        except ValueError:
+            self._send_error_json(400, "invalid corpus name")
+            return
+        out["corpus"] = corpus
+        try:
+            conn = open_db(corpus)
+            try:
+                out["versions"] = facets.corpus_versions(conn)
+            finally:
+                conn.close()
+        except Exception as e:  # noqa: BLE001
+            sys.stderr.write("[facets] %s\n" % e)
+        self._send_json(out)
+
     def _handle_chat(self, body):
         raw_corpus = body.get("corpus") or ""
         query = (body.get("query") or "").strip()
@@ -473,10 +507,32 @@ class DocRagHandler(http.server.BaseHTTPRequestHandler):
         if balance:
             top_k = max(top_k, 15)
 
+        # Location (global) + version (per-document) selectors -> retrieval
+        # filters. Location maps to allowed jurisdictions; versions default to
+        # the latest edition of each document with any client override applied.
+        location_key = (body.get("location") or facets.DEFAULT_LOCATION)
+        version_overrides = body.get("versions") or {}
+        filters = None
+        if corpus in _BALANCED_CORPORA:
+            try:
+                conn = open_db(corpus)
+                try:
+                    eff_versions = facets.resolve_versions(conn, version_overrides)
+                finally:
+                    conn.close()
+            except Exception as e:  # noqa: BLE001
+                sys.stderr.write("[chat] version resolve failed: %s\n" % e)
+                eff_versions = {}
+            filters = {
+                "location": location_key,
+                "versions": eff_versions,
+            }
+
         t0 = time.monotonic()
         try:
             if sources_only:
-                retrieval = rag_query(corpus, query, top_k=top_k, balance=balance)
+                retrieval = rag_query(corpus, query, top_k=top_k,
+                                      filters=filters, balance=balance)
                 envelope = {
                     "answer": None, "citations": [],
                     "chunks": retrieval.get("results") or [],
@@ -488,7 +544,8 @@ class DocRagHandler(http.server.BaseHTTPRequestHandler):
             else:
                 envelope = rag_answer_call(corpus=corpus, query=query,
                                            history=history, top_k=top_k,
-                                           balance=balance)
+                                           filters=filters, balance=balance,
+                                           location=location_key)
                 envelope["sources_only"] = False
         except FileNotFoundError as e:
             sys.stderr.write("[chat] DB missing: %s\n" % e)
@@ -507,6 +564,7 @@ class DocRagHandler(http.server.BaseHTTPRequestHandler):
         envelope["corpus"] = corpus
         envelope["query"] = query
         envelope["balance"] = balance
+        envelope["location"] = location_key
         self._send_json(envelope)
 
     def _handle_source(self, qs):

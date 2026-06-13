@@ -23,7 +23,8 @@ from . import settings
 from .query import rag_query
 
 
-CHUNK_CHAR_BUDGET = 1500
+CHUNK_CHAR_BUDGET = 2000          # per-section cap (parents are richer now)
+TOTAL_CONTEXT_BUDGET = 16000      # overall cap; later chunks get tightened
 CHAT_TEMPERATURE = 0.2
 CHAT_MAX_TOKENS = 600
 MAX_ATTEMPTS = 6
@@ -62,9 +63,9 @@ CROSS_JURISDICTION_NOTE = (
     "International Code (IBC), the North Carolina state amendments (NC 2024 "
     "codes), and the Durham UDO (local ordinance). When the question touches "
     "all three, structure the answer as: the model/baseline requirement, then "
-    "how North Carolina amends or adopts it, then any Durham-specific local "
-    "rule -- and state which one governs in Durham, North Carolina. Cite each "
-    "layer. If a layer is silent on the topic, say so rather than inferring.\n"
+    "how North Carolina amends or adopts it, then any local ordinance rule -- "
+    "and state which one governs in %s. Cite each layer. If a layer is silent "
+    "on the topic, say so rather than inferring.\n"
 )
 
 USER_PROMPT_TEMPLATE = (
@@ -94,14 +95,36 @@ def _truncate_chunk_text(text: str, budget: int = CHUNK_CHAR_BUDGET) -> str:
     return text[: budget - 3].rstrip() + "..."
 
 
+def _chunk_label(c: dict) -> str:
+    """Human-readable provenance for a retrieved section."""
+    parts = [c.get("source_file") or "unknown"]
+    num = c.get("section_number")
+    title = c.get("section_title")
+    head = " ".join(x for x in (num, title) if x)
+    if head:
+        parts.append("§ " + head)
+    page = c.get("page")
+    if page is not None:
+        parts.append("p.%s" % page)
+    label = " | ".join(parts)
+    if c.get("referenced"):
+        label += " (cross-referenced by %s)" % (c.get("referenced_by") or "")
+    return label
+
+
 def _build_chunks_block(chunks: list[dict]) -> str:
+    """Numbered chunk block with a per-section and total context budget.
+
+    Parent-document sections can be large, so cap each one and tighten later
+    chunks once the running total passes TOTAL_CONTEXT_BUDGET -- prevents prompt
+    bloat / cost blowups while keeping the top hits full."""
     lines = []
+    total = 0
     for i, c in enumerate(chunks, start=1):
-        snippet = _truncate_chunk_text(c.get("text") or "")
-        page = c.get("page")
-        page_str = str(page) if page is not None else "-"
-        source_file = c.get("source_file") or "unknown"
-        lines.append('[%d] %s (p.%s)\n"%s"' % (i, source_file, page_str, snippet))
+        budget = CHUNK_CHAR_BUDGET if total < TOTAL_CONTEXT_BUDGET else 400
+        snippet = _truncate_chunk_text(c.get("text") or "", budget)
+        total += len(snippet)
+        lines.append('[%d] %s\n"%s"' % (i, _chunk_label(c), snippet))
     return "\n\n".join(lines)
 
 
@@ -186,11 +209,12 @@ def _refused(chunks, reason, status):
 
 def answer(corpus: str, query: str, history: list[dict] | None = None,
            top_k: int = 12, filters: dict | None = None,
-           balance: bool = False) -> dict:
+           balance: bool = False, location: str | None = None) -> dict:
     """Retrieve + synthesize a grounded, cited answer.
 
     ``balance=True`` enables jurisdiction-balanced retrieval + cross-code
-    synthesis guidance (model IBC / NC state / Durham UDO).
+    synthesis guidance (model IBC / NC state / local). ``location`` (a
+    facets.LOCATIONS key) sets the "which governs in <place>" phrasing.
 
     Returns ``{answer, citations, chunks, refused, refusal_reason, status,
     tokens}``.
@@ -209,7 +233,9 @@ def answer(corpus: str, query: str, history: list[dict] | None = None,
     if r_status == "low_confidence":
         return _refused(chunks, "low_confidence", "refused")
 
-    system_prompt = SYSTEM_PROMPT + (CROSS_JURISDICTION_NOTE if applied_balance else "")
+    from .facets import answer_location
+    cross_note = CROSS_JURISDICTION_NOTE % answer_location(location)
+    system_prompt = SYSTEM_PROMPT + (cross_note if applied_balance else "")
     chunks_block = _build_chunks_block(chunks)
     user_prompt = USER_PROMPT_TEMPLATE.format(query=query, chunks_block=chunks_block)
 

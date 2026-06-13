@@ -25,7 +25,10 @@ from typing import Optional
 
 from . import settings
 from .chunk import chunk_extracted
-from .db import file_row, insert_chunks, open_db, purge_file, stats, upsert_file
+from .db import (
+    file_row, insert_chunks, insert_section_nodes, insert_section_refs,
+    open_db, purge_file, schema_outdated, stats, upsert_file,
+)
 from .embed import EmbedError, embed_batch
 from .extract import extract_file, iter_eligible_files, iter_skipped_files
 
@@ -91,6 +94,51 @@ def _guard_embed_input(text: str, rel_path: str) -> str:
     return text[: MAX_EMBED_INPUT_CHARS - 3] + "..."
 
 
+def _resolve_refs(conn, corpus: str) -> int:
+    """Resolve section_refs.dst_section_id from dst_raw, after all sections
+    exist. Internal refs match a section_number (same path preferred); NCGS
+    refs match the section whose full_text most contains the statute number.
+    Returns the count newly resolved."""
+    rows = conn.execute(
+        "SELECT section_id, section_number, path FROM section_nodes "
+        "WHERE corpus=? AND section_number IS NOT NULL", (corpus,)
+    ).fetchall()
+    by_num: dict[str, list[tuple[str, str]]] = {}
+    for sid, num, path in rows:
+        by_num.setdefault(num, []).append((sid, path))
+        # also index without a leading letter (R105.2 -> 105.2) for cross-code refs
+        bare = num.lstrip("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+        if bare != num:
+            by_num.setdefault(bare, []).append((sid, path))
+
+    pending = conn.execute(
+        "SELECT rowid, src_section_id, dst_raw, dst_kind, path FROM section_refs "
+        "WHERE corpus=? AND dst_section_id IS NULL", (corpus,)
+    ).fetchall()
+    n = 0
+    cur = conn.cursor()
+    for rowid, src, raw, kind, path in pending:
+        target = None
+        if kind == "internal_section":
+            cands = by_num.get(raw) or by_num.get(raw.lstrip("R")) or []
+            same = [sid for sid, p in cands if p == path and sid != src]
+            other = [sid for sid, p in cands if sid != src]
+            target = (same or other or [None])[0]
+        elif kind == "ncgs":
+            row = cur.execute(
+                "SELECT section_id FROM section_nodes WHERE corpus=? "
+                "AND section_id<>? AND full_text LIKE ? "
+                "ORDER BY length(full_text) DESC LIMIT 1",
+                (corpus, src, "%" + raw + "%"),
+            ).fetchone()
+            target = row[0] if row else None
+        if target:
+            cur.execute("UPDATE section_refs SET dst_section_id=? WHERE rowid=?",
+                        (target, rowid))
+            n += 1
+    return n
+
+
 def _plan_work(conn, corpus: str, full: bool, limit: int):
     todo: list[dict] = []
     reasons: dict = {"hash_unchanged": 0}
@@ -137,6 +185,12 @@ def _do_build(args) -> int:
         traceback.print_exc(file=sys.stderr)
         return 1
 
+    # A schema bump invalidates old rows (chunk boundaries + columns changed).
+    # Force a full reindex so every file is re-chunked under the new schema.
+    if schema_outdated(conn) and not args.full:
+        sys.stderr.write("[index] schema changed -> forcing --full reindex\n")
+        args.full = True
+
     try:
         todo, reasons = _plan_work(conn, corpus, full=args.full, limit=args.limit)
         conn.commit()
@@ -152,17 +206,20 @@ def _do_build(args) -> int:
                 upsert_file(conn, entry["path"], entry["sha256"], entry["size"])
                 reasons["no_text_extracted"] = reasons.get("no_text_extracted", 0) + 1
                 continue
-            chunks = chunk_extracted(corpus, entry, extracted)
-            if not chunks:
+            result = chunk_extracted(corpus, entry, extracted)
+            leaves = result.get("chunks") or []
+            if not leaves:
                 sys.stderr.write("[index] no_chunks: %s\n" % entry["path"])
                 upsert_file(conn, entry["path"], entry["sha256"], entry["size"])
                 reasons["no_chunks"] = reasons.get("no_chunks", 0) + 1
                 continue
-            for c in chunks:
+            for c in leaves:
                 c["embed_input"] = _guard_embed_input(c["embed_input"], entry["path"])
                 total_chars += len(c["embed_input"])
-            prepared.append({"entry": entry, "chunks": chunks})
-            total_chunks += len(chunks)
+            prepared.append({"entry": entry, "chunks": leaves,
+                             "sections": result.get("sections") or [],
+                             "refs": result.get("refs") or []})
+            total_chunks += len(leaves)
         conn.commit()
 
         est_tokens = total_chars // 4 if total_chars else 0
@@ -227,12 +284,21 @@ def _do_build(args) -> int:
                 )
                 continue
             upsert_file(conn, entry["path"], entry["sha256"], entry["size"])
+            insert_section_nodes(conn, item.get("sections") or [])
             insert_chunks(conn, chunks, vecs)
+            insert_section_refs(conn, item.get("refs") or [])
             conn.commit()
             indexed_files += 1
             indexed_chunks += len(chunks)
-            sys.stderr.write("[index] %s/%s: %d chunks\n"
-                             % (corpus, entry["path"], len(chunks)))
+            sys.stderr.write("[index] %s/%s: %d chunks / %d sections\n"
+                             % (corpus, entry["path"], len(chunks),
+                                len(item.get("sections") or [])))
+
+        # Resolve citation-graph edges now that every section exists.
+        resolved = _resolve_refs(conn, corpus)
+        conn.commit()
+        if resolved:
+            sys.stderr.write("[index] resolved %d citation refs\n" % resolved)
 
         used_usd = (used_tokens / 1_000_000.0) * EMBED_PRICE_PER_MTOKEN
         _print_summary(corpus, indexed_files, indexed_chunks, reasons,

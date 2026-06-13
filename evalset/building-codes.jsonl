@@ -1,0 +1,10 @@
+{"q": "In Durham do I need a building permit for a small accessory structure?", "expect": ["160D-1110", "permit", "106"], "note": "permit requirement + statutory exemption (cross-reference hop)"}
+{"q": "What is the minimum clear width of an egress door?", "expect": ["1010", "32 inches", "clear width"], "note": "IBC egress door width"}
+{"q": "How is fire separation distance used to rate exterior walls?", "expect": ["705", "fire separation distance", "Table 705"], "note": "exterior wall fire rating"}
+{"q": "What are the setback requirements for an accessory dwelling unit?", "expect": ["accessory dwelling", "setback", "ADU"], "note": "Durham UDO zoning"}
+{"q": "What are the minimum riser height and tread depth for stairways?", "expect": ["1011", "riser", "tread"], "note": "stair geometry"}
+{"q": "How are occupancy groups classified?", "expect": ["302", "occupancy", "Group"], "note": "occupancy classification"}
+{"q": "What work is exempt from requiring a permit in North Carolina?", "expect": ["exempt", "permit", "160D-1110"], "note": "NC permit exemptions"}
+{"q": "What are the requirements for guards and handrails?", "expect": ["1015", "guard", "handrail"], "note": "guards/handrails"}
+{"q": "What is the minimum ceiling height for habitable rooms?", "expect": ["ceiling height", "1208", "7 feet"], "note": "ceiling height"}
+{"q": "When is an automatic sprinkler system required?", "expect": ["903", "sprinkler", "automatic"], "note": "fire protection systems"}

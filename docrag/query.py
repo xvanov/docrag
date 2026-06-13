@@ -1,21 +1,22 @@
-"""query.py -- Hybrid (vector + BM25) retrieval over a corpus index.
+"""query.py -- hybrid retrieval + rerank + parent-document collapse.
 
-Pipeline:
-  1. Encode the query via embed.embed_one().
-  2. Vector top-50 from vec_chunks (sqlite-vec MATCH).
-  3. BM25 top-50 from fts_chunks (FTS5).
-  4. Reciprocal Rank Fusion (k=60).
-  5. Optional post-filters (kind whitelist, source_file glob).
-  6. Word-boundary post-filter for short uppercase codes (anti-hallucination):
-     if the query contains a token like ``^[A-Z0-9]{2,8}$`` with >=1 uppercase
-     letter, drop chunks lacking a word-boundary match for at least one such
-     token. Pure prose queries skip this filter.
+Pipeline (2026 best-practice):
+  1. Encode the query; vector top-50 (sqlite-vec) + BM25 top-50 (FTS5, with the
+     section-metadata column down-weighted vs. body).
+  2. Reciprocal Rank Fusion (k=60) over leaf chunks.
+  3. Cross-encoder rerank of the fused leaf candidates (optional; no-op if the
+     reranker isn't installed -- see rerank.py).
+  4. Collapse leaves to their section's parent-document text (small-to-big),
+     dedup, drop ancestors subsumed by a retained descendant.
+  5. Adaptive jurisdiction balancing (skip when one jurisdiction dominates).
+  6. One-hop citation-graph expansion: pull resolved cross-referenced sections
+     ("see NCGS 160D-1110") as labeled supporting context.
   7. Trim to top_k.
 
-Status values: "ok" | "no_results" | "low_confidence".
+Status: "ok" | "no_results" | "low_confidence".
 
 Public API:
-    rag_query(corpus, query, top_k=12, filters=None) -> dict
+    rag_query(corpus, query, top_k=8, filters=None, balance=False) -> dict
 """
 
 from __future__ import annotations
@@ -24,42 +25,104 @@ import fnmatch
 import re
 import struct
 
-from .db import open_db
+from . import settings
+from .db import get_refs, get_section, open_db
 from .embed import embed_one
-
+from .facets import facet_of, location_allows
+from .rerank import rerank
 
 RRF_K = 60
-VEC_TOP_K = 50
-BM25_TOP_K = 50
-LOW_CONFIDENCE_THRESHOLD = 0.01
+VEC_TOP_K = 80
+BM25_TOP_K = 80
+# When a location / version filter is active, over-fetch candidates so the
+# filtered pool isn't starved by excluded jurisdictions / editions.
+VEC_TOP_K_FILTERED = 250
+BM25_TOP_K_FILTERED = 250
+RERANK_POOL = 72          # leaves reranked before collapse (stratified pool)
+LOW_CONFIDENCE_RRF = 0.01
+LOW_CONFIDENCE_RERANK = 0.02
+MAX_REF_EXPANSION = 3     # extra cross-referenced sections per query
+_REF_SCORE = -1.0         # sentinel: expansion sections sort last, ignore in stats
 
 _SHORT_CODE_RE = re.compile(r"^(?=[A-Z0-9]{2,8}$)[A-Z0-9]*[A-Z][A-Z0-9]*$")
+_FTS_SYNTAX_RE = re.compile(r'[\"\(\)\*\:\^]')
 
-# Map a chunk's relative path to a jurisdiction bucket (building-codes corpus:
-# model IBC vs. NC state code vs. Durham local ordinance).
-_JURISDICTIONS = (
-    ("north-carolina/", "north-carolina"),
-    ("model/", "model"),
-    ("durham/", "durham"),
-)
+# Jurisdiction buckets for the building-codes corpus (model / state / local).
+_JURISDICTIONS = (("north-carolina/", "north-carolina"), ("model/", "model"),
+                  ("durham/", "durham"))
+_DOMINANCE_FRAC = 0.6
 
 
-def _jurisdiction(path: str) -> str:
-    p = (path or "").replace("\\", "/").lstrip("/")
+def _pack_vec(vec) -> bytes:
+    floats = list(vec)
+    return struct.pack("%df" % len(floats), *floats)
+
+
+def _fts_query(raw: str) -> str:
+    cleaned = _FTS_SYNTAX_RE.sub(" ", raw or "")
+    tokens = [t for t in re.split(r"\s+", cleaned) if t]
+    if not tokens:
+        return ""
+    return " OR ".join('"%s"' % t.replace('"', "") for t in tokens)
+
+
+def _short_codes(query: str) -> list[str]:
+    out = []
+    for tok in re.split(r"[\s,;:()\[\]{}/]+", query or ""):
+        tok = tok.strip(".-'\"")
+        if tok and _SHORT_CODE_RE.match(tok):
+            out.append(tok)
+    return out
+
+
+def _jurisdiction_of(row: dict) -> str:
+    j = row.get("jurisdiction")
+    if j:
+        return j
+    p = (row.get("path") or "").replace("\\", "/").lstrip("/")
     for prefix, name in _JURISDICTIONS:
         if p.startswith(prefix):
             return name
     return p.split("/", 1)[0] if "/" in p else "_root"
 
 
+def _row_to_result(row: dict, score: float, text: str, referenced: bool = False) -> dict:
+    return {
+        "chunk_id": row.get("id"),
+        "path": row.get("path"),
+        "source_file": row.get("source_file"),
+        "kind": row.get("node_type") or row.get("kind") or "document",
+        "page": row.get("page"),
+        "start_line": row.get("start_line"),
+        "end_line": row.get("end_line"),
+        "section_id": row.get("section_id"),
+        "section_number": row.get("section_number"),
+        "section_title": row.get("section_title"),
+        "breadcrumb": row.get("breadcrumb"),
+        "jurisdiction": row.get("jurisdiction"),
+        "edition": row.get("edition"),
+        "text": text,
+        "score": score,
+        "referenced": referenced,
+    }
+
+
+def _balance_dominated(results: list[dict], window: int, frac: float = _DOMINANCE_FRAC) -> bool:
+    top = results[:window]
+    if not top:
+        return True
+    counts: dict[str, int] = {}
+    for r in top:
+        counts[_jurisdiction_of(r)] = counts.get(_jurisdiction_of(r), 0) + 1
+    if len(counts) <= 1:
+        return True
+    return max(counts.values()) / len(top) >= frac
+
+
 def _balance_by_jurisdiction(results: list[dict], top_k: int) -> list[dict]:
-    """Round-robin interleave RRF-ordered results across jurisdictions so a
-    multi-source corpus surfaces every jurisdiction that has hits, instead of
-    letting one code dominate the top_k. Rank order is preserved within each
-    bucket; buckets are visited in order of their best (first) result."""
     buckets: dict[str, list[dict]] = {}
     for r in results:
-        buckets.setdefault(_jurisdiction(r.get("path")), []).append(r)
+        buckets.setdefault(_jurisdiction_of(r), []).append(r)
     if len(buckets) <= 1:
         return results[:top_k]
     order = sorted(buckets, key=lambda k: results.index(buckets[k][0]))
@@ -73,166 +136,238 @@ def _balance_by_jurisdiction(results: list[dict], top_k: int) -> list[dict]:
     return out
 
 
-# When one jurisdiction holds this share of the top window, the question is
-# jurisdiction-specific (e.g. an NC permit rule) and balancing would only
-# dilute it -- so plain RRF is kept instead of interleaving.
-_DOMINANCE_FRAC = 0.6
-
-
-def _jurisdiction_dominated(results: list[dict], window: int,
-                            frac: float = _DOMINANCE_FRAC) -> bool:
-    """True if a single jurisdiction owns >= ``frac`` of the top ``window``
-    RRF results (or only one jurisdiction is present at all)."""
-    top = results[:window]
-    if not top:
-        return True
-    counts: dict[str, int] = {}
-    for r in top:
-        j = _jurisdiction(r.get("path"))
-        counts[j] = counts.get(j, 0) + 1
-    if len(counts) <= 1:
-        return True
-    return max(counts.values()) / len(top) >= frac
-# FTS5 syntax characters we strip to keep the query a plain token bag.
-_FTS_SYNTAX_RE = re.compile(r'[\"\(\)\*\:\^]')
-
-
-def _pack_vec(vec) -> bytes:
-    floats = list(vec)
-    return struct.pack("%df" % len(floats), *floats)
-
-
-def _fts_query(raw: str) -> str:
-    """Sanitize a user query into an FTS5 OR-of-tokens MATCH string."""
-    cleaned = _FTS_SYNTAX_RE.sub(" ", raw or "")
-    tokens = [t for t in re.split(r"\s+", cleaned) if t]
-    if not tokens:
-        return ""
-    # Quote each token so FTS treats it literally; join with OR.
-    return " OR ".join('"%s"' % t.replace('"', "") for t in tokens)
-
-
-def _short_codes(query: str) -> list[str]:
-    out = []
-    for tok in re.split(r"[\s,;:()\[\]{}/]+", query or ""):
-        tok = tok.strip(".-'\"")
-        if tok and _SHORT_CODE_RE.match(tok):
-            out.append(tok)
+def _stratified_pool(leaves: list[dict], cap: int) -> list[dict]:
+    """Round-robin the RRF-ordered leaves across jurisdictions up to ``cap`` so
+    every jurisdiction's best candidates reach the reranker (preventing one
+    jurisdiction from flooding the pool). Order within a jurisdiction is the
+    RRF order; the reranker re-scores the whole pool afterward."""
+    buckets: dict[str, list[dict]] = {}
+    for lf in leaves:
+        buckets.setdefault(_jurisdiction_of(lf), []).append(lf)
+    if len(buckets) <= 1:
+        return leaves[:cap]
+    order = sorted(buckets, key=lambda k: leaves.index(buckets[k][0]))
+    out: list[dict] = []
+    i = 0
+    while len(out) < cap and any(buckets[k] for k in order):
+        b = buckets[order[i % len(order)]]
+        if b:
+            out.append(b.pop(0))
+        i += 1
     return out
 
 
-def _row_to_chunk(row: dict, score: float) -> dict:
-    return {
-        "chunk_id": row["id"],
-        "path": row["path"],
-        "source_file": row["source_file"],
-        "kind": row["kind"],
-        "page": row["page"],
-        "start_line": row["start_line"],
-        "end_line": row["end_line"],
-        "text": row["text"],
-        "score": score,
-    }
+def _expand_refs_enabled() -> bool:
+    val = (settings.get("DOCRAG_EXPAND_REFS", "1") or "1").strip().lower()
+    return val not in ("0", "false", "no", "off")
 
 
-def rag_query(corpus: str, query: str, top_k: int = 12,
+def rag_query(corpus: str, query: str, top_k: int = 8,
               filters: dict | None = None, balance: bool = False) -> dict:
-    """Hybrid retrieve top_k chunks for ``query`` from ``corpus``.
-
-    ``balance=True`` interleaves results across jurisdiction buckets (model /
-    north-carolina / durham) so a cross-code question draws from all sources.
-    """
+    """Hybrid retrieve + rerank + parent-collapse top_k sections for ``query``."""
     query = (query or "").strip()
     if not query:
-        return {"status": "no_results", "results": []}
+        return {"status": "no_results", "results": [], "balanced": False}
+
+    filters = filters or {}
+    _loc = filters.get("location")
+    _versions = filters.get("versions") or {}
+    _filtered = bool(_loc or _versions)
+    vlim = VEC_TOP_K_FILTERED if _filtered else VEC_TOP_K
+    blim = BM25_TOP_K_FILTERED if _filtered else BM25_TOP_K
 
     conn = open_db(corpus)
     try:
-        # --- Vector ranking -------------------------------------------------
+        # --- Vector + BM25 -> RRF over leaves -------------------------------
         qvec = embed_one(query)
         vec_rows = conn.execute(
             "SELECT chunk_id FROM vec_chunks WHERE embedding MATCH ? "
-            "ORDER BY distance LIMIT ?",
-            (_pack_vec(qvec), VEC_TOP_K),
+            "ORDER BY distance LIMIT ?", (_pack_vec(qvec), vlim),
         ).fetchall()
         vec_rank = {r[0]: i + 1 for i, r in enumerate(vec_rows)}
 
-        # --- BM25 ranking ---------------------------------------------------
         bm25_rank: dict[int, int] = {}
         fts_match = _fts_query(query)
         if fts_match:
             try:
                 fts_rows = conn.execute(
                     "SELECT rowid FROM fts_chunks WHERE fts_chunks MATCH ? "
-                    "ORDER BY rank LIMIT ?",
-                    (fts_match, BM25_TOP_K),
+                    "ORDER BY bm25(fts_chunks, 1.0, 0.3) LIMIT ?",
+                    (fts_match, blim),
                 ).fetchall()
                 bm25_rank = {r[0]: i + 1 for i, r in enumerate(fts_rows)}
-            except Exception:  # noqa: BLE001 -- malformed FTS query, vec-only
+            except Exception:  # noqa: BLE001 -- malformed FTS, vec-only
                 bm25_rank = {}
 
-        # --- Reciprocal Rank Fusion ----------------------------------------
         fused: dict[int, float] = {}
         for cid, rank in vec_rank.items():
             fused[cid] = fused.get(cid, 0.0) + 1.0 / (RRF_K + rank)
         for cid, rank in bm25_rank.items():
             fused[cid] = fused.get(cid, 0.0) + 1.0 / (RRF_K + rank)
-
         if not fused:
-            return {"status": "no_results", "results": []}
+            return {"status": "no_results", "results": [], "balanced": False}
 
         ordered_ids = sorted(fused, key=lambda c: fused[c], reverse=True)
 
-        # --- Hydrate chunk rows --------------------------------------------
+        # --- Hydrate leaf rows ---------------------------------------------
         ph = ",".join("?" * len(ordered_ids))
         cur = conn.execute(
-            "SELECT id, path, source_file, kind, page, start_line, end_line, "
-            "text FROM chunks WHERE id IN (%s)" % ph,
-            ordered_ids,
+            "SELECT id, path, corpus, source_file, kind, page, start_line, "
+            "end_line, text, section_id, section_number, section_title, "
+            "breadcrumb, jurisdiction, edition, node_type "
+            "FROM chunks WHERE id IN (%s)" % ph, ordered_ids,
         )
         cols = [d[0] for d in cur.description]
         by_id = {r[0]: dict(zip(cols, r)) for r in cur.fetchall()}
+        leaves = [by_id[cid] for cid in ordered_ids if cid in by_id]
+        for lf in leaves:
+            lf["rrf"] = fused[lf["id"]]
 
-        results = []
-        for cid in ordered_ids:
-            row = by_id.get(cid)
-            if row:
-                results.append(_row_to_chunk(row, fused[cid]))
+        # --- Filters --------------------------------------------------------
+        if filters.get("types"):
+            allow = set(filters["types"])
+            leaves = [r for r in leaves if (r.get("node_type") or "leaf") in allow]
+        if filters.get("file_glob"):
+            g = filters["file_glob"]
+            leaves = [r for r in leaves if fnmatch.fnmatch(r.get("source_file") or "", g)]
 
-        # --- Post-filters ---------------------------------------------------
-        filters = filters or {}
-        types = filters.get("types")
-        if types:
-            allow = set(types)
-            results = [r for r in results if r["kind"] in allow]
-        file_glob = filters.get("file_glob")
-        if file_glob:
-            results = [r for r in results
-                       if fnmatch.fnmatch(r["source_file"] or "", file_glob)]
+        # Location (jurisdiction tier) + version (per-document edition) filters.
+        if _filtered:
+            kept = []
+            for r in leaves:
+                f = facet_of(r.get("path"), r.get("edition"))
+                if _loc and not location_allows(_loc, f["jurisdiction"]):
+                    continue
+                want = _versions.get(f["doc_key"])
+                if want and f["year"] and str(f["year"]) != str(want):
+                    continue
+                kept.append(r)
+            leaves = kept
 
-        # --- Short-code word-boundary filter -------------------------------
         codes = _short_codes(query)
         if codes:
-            patterns = [re.compile(r"\b%s\b" % re.escape(c)) for c in codes]
-            kept = [r for r in results
-                    if any(p.search(r["text"] or "") for p in patterns)]
-            # Only apply if it doesn't wipe out everything (semantic hits may
-            # legitimately paraphrase the code).
+            pats = [re.compile(r"\b%s\b" % re.escape(c)) for c in codes]
+            kept = [r for r in leaves if any(p.search(r.get("text") or "") for p in pats)]
             if kept:
+                leaves = kept
+        if not leaves:
+            return {"status": "no_results", "results": [], "balanced": False}
+
+        # --- Cross-encoder rerank (optional) -------------------------------
+        # When balancing, stratify the rerank input across jurisdictions so each
+        # layer's top RRF leaves reach the cross-encoder even if one jurisdiction
+        # floods RRF (e.g. "permit in Durham" must still surface the NC statute).
+        # The reranker then decides the final order by true relevance -- no
+        # fragile output-balancing/dominance toggle needed.
+        stratified = bool(balance)
+        pool = (_stratified_pool(leaves, RERANK_POOL) if stratified
+                else leaves[:RERANK_POOL])
+        rr = rerank(query, [lf.get("text") or "" for lf in pool])
+        used_rerank = rr is not None
+        if used_rerank:
+            for lf, s in zip(pool, rr):
+                lf["score"] = float(s)
+            pool.sort(key=lambda r: r["score"], reverse=True)
+        else:
+            for lf in pool:
+                lf["score"] = lf["rrf"]
+
+        # --- Collapse leaves to parent-document sections -------------------
+        seen: dict[str, dict] = {}
+        order_secs: list[str] = []
+        for lf in pool:
+            sid = lf.get("section_id") or ("leaf:%s" % lf["id"])
+            if sid not in seen:
+                node = get_section(conn, corpus, lf.get("section_id") or "")
+                text = (node or {}).get("full_text") or lf.get("text") or ""
+                res = _row_to_result(lf, lf["score"], text)
+                res["_parent_section_id"] = (node or {}).get("parent_section_id")
+                seen[sid] = res
+                order_secs.append(sid)
+            else:
+                if lf["score"] > seen[sid]["score"]:
+                    seen[sid]["score"] = lf["score"]
+
+        results = [seen[s] for s in order_secs]
+        results.sort(key=lambda r: r["score"], reverse=True)
+        results = _dedup_ancestors(results)
+
+        top_score = results[0]["score"] if results else 0.0
+
+        # Order is set by the reranker over a jurisdiction-stratified pool;
+        # just take the top_k. (No output re-balancing -- the cross-encoder
+        # already ranked across the layers that were guaranteed into the pool.)
+        applied = stratified
+        results = results[:top_k]
+
+        # --- One-hop citation-graph expansion ------------------------------
+        if _expand_refs_enabled():
+            results = _expand_references(conn, corpus, results)
+            # Expansion can pull cross-edition / cross-jurisdiction sections;
+            # re-apply the active filters so version/location stay honored.
+            if _filtered:
+                kept = []
+                for r in results:
+                    f = facet_of(r.get("path"), r.get("edition"))
+                    if _loc and not location_allows(_loc, f["jurisdiction"]):
+                        continue
+                    want = _versions.get(f["doc_key"])
+                    if want and f["year"] and str(f["year"]) != str(want):
+                        continue
+                    kept.append(r)
                 results = kept
 
-        if not results:
-            return {"status": "no_results", "results": []}
+        for r in results:
+            r.pop("_parent_section_id", None)
 
-        top_score = results[0]["score"]
-        # Adaptive balancing: only interleave across jurisdictions when no
-        # single one dominates the top hits. A jurisdiction-specific question
-        # (e.g. an NC permit threshold) keeps plain RRF so its best chunks
-        # aren't crowded out by forced cross-jurisdiction slots.
-        applied = bool(balance) and not _jurisdiction_dominated(results, max(top_k, 10))
-        results = (_balance_by_jurisdiction(results, top_k) if applied
-                   else results[:top_k])
-        status = "low_confidence" if top_score < LOW_CONFIDENCE_THRESHOLD else "ok"
+        if not results:
+            return {"status": "no_results", "results": [], "balanced": applied}
+        thresh = LOW_CONFIDENCE_RERANK if used_rerank else LOW_CONFIDENCE_RRF
+        status = "low_confidence" if top_score < thresh else "ok"
         return {"status": status, "results": results, "balanced": applied}
     finally:
         conn.close()
+
+
+def _dedup_ancestors(results: list[dict]) -> list[dict]:
+    """Drop a retained section when a retained descendant subsumes it (its
+    full_text already contains the descendant). Keeps the more specific hit."""
+    retained_ids = {r.get("section_id") for r in results if r.get("section_id")}
+    descendant_parents = set()
+    for r in results:
+        p = r.get("_parent_section_id")
+        # collect parent ids that are themselves retained -> they are ancestors
+        if p and p in retained_ids:
+            descendant_parents.add(p)
+    if not descendant_parents:
+        return results
+    return [r for r in results if r.get("section_id") not in descendant_parents]
+
+
+def _expand_references(conn, corpus: str, results: list[dict]) -> list[dict]:
+    have = {r.get("section_id") for r in results}
+    added = 0
+    extra: list[dict] = []
+    for r in results:
+        if added >= MAX_REF_EXPANSION:
+            break
+        sid = r.get("section_id")
+        if not sid:
+            continue
+        for ref in get_refs(conn, sid):
+            if added >= MAX_REF_EXPANSION:
+                break
+            dst = ref.get("dst_section_id")
+            if not dst or dst in have:
+                continue
+            node = get_section(conn, corpus, dst)
+            if not node:
+                continue
+            have.add(dst)
+            res = _row_to_result(node, _REF_SCORE, node.get("full_text") or "",
+                                 referenced=True)
+            res["referenced_by"] = r.get("section_number") or sid
+            res["reference_raw"] = ref.get("dst_raw")
+            extra.append(res)
+            added += 1
+    return results + extra

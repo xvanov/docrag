@@ -1,0 +1,7 @@
+# Scraper-only deps (ICC Digital Codes -> corpora/building-codes/north-carolina)
+# Install + browser:  pip install -r scraper/requirements.txt && playwright install chromium
+playwright>=1.44.0
+requests>=2.31.0
+python-dotenv>=1.0.0
+beautifulsoup4>=4.12.0
+lxml>=5.0.0

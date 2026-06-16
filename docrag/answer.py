@@ -23,10 +23,10 @@ from . import settings
 from .query import rag_query
 
 
-CHUNK_CHAR_BUDGET = 2000          # per-section cap (parents are richer now)
-TOTAL_CONTEXT_BUDGET = 16000      # overall cap; later chunks get tightened
+CHUNK_CHAR_BUDGET = 4500          # per-section cap (parents are richer now)
+TOTAL_CONTEXT_BUDGET = 48000      # overall cap; later chunks get tightened
 CHAT_TEMPERATURE = 0.2
-CHAT_MAX_TOKENS = 600
+CHAT_MAX_TOKENS = 900
 MAX_ATTEMPTS = 6
 INITIAL_DELAY_S = 1.0
 MAX_DELAY_S = 60.0
@@ -34,38 +34,88 @@ MAX_DELAY_S = 60.0
 MODEL_REFUSAL_SENTENCE = "I don't have documentation for that."
 
 SYSTEM_PROMPT = (
-    "You are a research assistant grounded in excerpts from a document "
-    "collection.\n\n"
+    "You are a regulatory research assistant grounded in excerpts from a "
+    "collection of building codes, statutes, and ordinances.\n\n"
     "RULES:\n"
-    "1. Answer ONLY using the provided chunks below. Do not introduce facts "
-    "from outside knowledge.\n"
+    "1. Ground every claim in the provided chunks. Do not introduce facts, "
+    "values, codes, or rules from outside the chunks.\n"
     "2. Every factual claim must be followed by a citation in square brackets "
     "like [1] or [2,3].\n"
-    "3. If the chunks do not contain enough information to answer, respond "
+    "3. NAME the specific provision you rely on, not just the document. Each "
+    "chunk is labeled with its edition/jurisdiction and section designation "
+    "(e.g. 'NC Residential Code R101.2.1 Accessory buildings', "
+    "'NCGS 160D-1110', 'IBC Section 1010'). State that designation in prose "
+    "alongside the bare [N], e.g. \"Under NC Residential Code R101.2.1 [3], ...\".\n"
+    "4. REASON over the rules; do not merely quote them. Apply the cited rules "
+    "to the specific facts in the question using ordinary deductive reasoning "
+    "(compare a stated cost to a stated threshold; check whether the work or "
+    "structure matches an enumerated trigger or exemption).\n"
+    "5. Rules often define their own SCOPE -- the conditions under which a "
+    "requirement applies. If a rule states WHEN something is regulated (a size, "
+    "a cost threshold, an enumerated trigger) and the facts of the question "
+    "fall OUTSIDE that scope, conclude that the requirement does not apply, and "
+    "present this explicitly as an inference from the rule's scope, citing the "
+    "provision. (Example shape: a rule says structures with any dimension over "
+    "X must comply; a structure under X in every dimension therefore falls "
+    "outside that requirement.) Distinguish 'the documents are silent on this' "
+    "from 'the documents address this and the answer follows from them'.\n"
+    "5a. Treat a scope threshold as DEFINITIONAL, not merely permissive. A "
+    "general requirement (e.g. a statute saying construction needs a permit "
+    "'as required by the Code') is qualified by the specific Code provisions "
+    "that define what the Code actually regulates. So when the governing "
+    "provision regulates a class only above a threshold and the facts fall "
+    "below it, and no OTHER cited provision independently brings the item in, "
+    "conclude the requirement does NOT apply -- do not default to 'required' "
+    "merely because no clause uses the word 'exempt'. Absence of an explicit "
+    "exemption is not the same as being regulated; reason from scope. State "
+    "your assumption and note it follows from the cited provisions' scope.\n"
+    "6. Do not fabricate. If a chunk doesn't state or imply it, don't state it. "
+    "If the chunks genuinely do not let you reason to an answer, respond "
     "exactly: \"" + MODEL_REFUSAL_SENTENCE + "\"\n"
-    "4. Do not fabricate values, names, codes, or behaviors. If a chunk "
-    "doesn't state it, do not state it.\n"
-    "5. Keep answers concise -- no more than 5 sentences unless the question "
-    "clearly needs more.\n"
-    "6. Quote short snippets when they are diagnostic, but always cite the "
-    "source chunk index with bare [N].\n"
-    "7. Chunks may come from different source documents (the document name is "
-    "shown before each excerpt). When facts come from more than one document, "
-    "name the source document for each claim. If documents conflict or one "
-    "amends or is more specific than another (e.g. a local code vs. a model "
-    "code), say so and make clear which source governs.\n"
+    "7. Be concise but show the reasoning steps that lead to the conclusion.\n"
+    "8. Chunks may come from different source documents. When facts come from "
+    "more than one, name the source/provision for each. If one source amends "
+    "or is more specific than another (e.g. a local code or state statute vs. "
+    "a model code), say so and make clear which governs.\n"
 )
 
 # Extra guidance when balanced retrieval spans the three building-code
 # jurisdictions, so the answer synthesizes across all of them.
 CROSS_JURISDICTION_NOTE = (
-    "\nThese excerpts span three layers of building regulation: the model "
-    "International Code (IBC), the North Carolina state amendments (NC 2024 "
-    "codes), and the Durham UDO (local ordinance). When the question touches "
-    "all three, structure the answer as: the model/baseline requirement, then "
-    "how North Carolina amends or adopts it, then any local ordinance rule -- "
-    "and state which one governs in %s. Cite each layer. If a layer is silent "
-    "on the topic, say so rather than inferring.\n"
+    "\nEach excerpt is tagged with an authority class: [STATE] (NC statutes / "
+    "NC State Building Code), [LOCAL] (Durham UDO / county ordinance text), "
+    "[LOCAL-GUIDANCE] (durhamnc.gov agency how-to pages), [MODEL] (IBC/IRC/... "
+    "model codes), [FEDERAL]. Resolve which one governs in %s using NORTH "
+    "CAROLINA's FIELD-PREEMPTION framework -- NOT a fixed rank:\n"
+    "- State law is PRIMARY where it provides a complete, integrated regulatory "
+    "scheme. The BUILDING-PERMIT REQUIREMENT (NCGS 160D-1110) and the NC STATE "
+    "BUILDING CODE (construction / life-safety / accessibility standards) are "
+    "such schemes: here [STATE] governs, and a [LOCAL] ordinance or "
+    "[LOCAL-GUIDANCE] page CANNOT change the permit trigger or relax/tighten the "
+    "building code. Base permit-required/exempt and code-standard conclusions on "
+    "[STATE] law.\n"
+    "- Where the state DELEGATES to local government -- zoning, land use, "
+    "setbacks, placement, lot coverage, height-as-zoning, subdivision design, "
+    "local stormwater -- the [LOCAL] Durham UDO governs and MAY be stricter than "
+    "any state minimum. Base zoning/siting conclusions on the [LOCAL] UDO.\n"
+    "- [LOCAL-GUIDANCE] pages (durhamnc.gov) are the permitting authority's own "
+    "statements of local practice. When the [STATE] statute / [LOCAL] ordinance "
+    "is SILENT or only general on the point, you MAY rely on the guidance as the "
+    "best available answer (e.g. 'Durham does not require a permit for an "
+    "ordinary fence') -- note it is agency guidance. But when a guidance page "
+    "CONFLICTS with or OVER-GENERALIZES a more specific [STATE] statute or "
+    "[LOCAL] ordinance (e.g. a flat 'a permit is always required' that ignores a "
+    "statutory cost/scope exemption), defer to the primary instrument and FLAG "
+    "the divergence. Do not refuse or hedge when the guidance gives a clear "
+    "answer the primary law does not contradict.\n"
+    "- [MODEL] provisions are background only unless NC adopted them; a model "
+    "exemption absent from NC law does not apply in NC.\n"
+    "- A SCOPE rule (which structures must meet the building code's construction "
+    "standards) is a DIFFERENT question from the PERMIT requirement. Never cite "
+    "a code-scope provision as evidence that no permit is required -- the permit "
+    "trigger is NCGS 160D-1110, not the code's construction scope.\n"
+    "Name the governing instrument and class for each conclusion; if the "
+    "controlling layer is silent, say so rather than inferring.\n"
 )
 
 USER_PROMPT_TEMPLATE = (
@@ -88,16 +138,114 @@ def _normalize_quotes(s: str) -> str:
     return (s or "").replace("’", "'").replace("‘", "'")
 
 
-def _truncate_chunk_text(text: str, budget: int = CHUNK_CHAR_BUDGET) -> str:
+_QTERM_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9.\-$]{1,}")
+_STOPWORDS = frozenset(
+    "a an the of to in for and or is are do does my i you it this that with "
+    "be can will shall on at as by from need require required".split())
+
+
+def _query_terms(query: str) -> list[str]:
+    out = []
+    for m in _QTERM_RE.finditer((query or "").lower()):
+        t = m.group(0)
+        if len(t) >= 3 and t not in _STOPWORDS:
+            out.append(t)
+    return out
+
+
+def _truncate_chunk_text(text: str, budget: int = CHUNK_CHAR_BUDGET,
+                         query: str | None = None) -> str:
+    """Trim a chunk to ``budget`` chars.
+
+    When the chunk is over budget, keep a window CENTERED on the query-relevant
+    span (the earliest..latest position any query term appears) instead of the
+    head -- so a long section never loses its operative clause to a blind head
+    cut. Falls back to a head cut when no query term matches. Generic: uses only
+    the user's own query terms, no document-specific rules.
+    """
     text = " ".join((text or "").split())
     if len(text) <= budget:
         return text
-    return text[: budget - 3].rstrip() + "..."
+
+    terms = _query_terms(query or "")
+    low = text.lower()
+    # All occurrences of every query term (not just the first) -- a long section
+    # mentions a term in many places, and the operative clause is wherever they
+    # CLUSTER, not the midpoint of the first..last span.
+    hits = []
+    for t in terms:
+        start = 0
+        while True:
+            i = low.find(t, start)
+            if i < 0:
+                break
+            hits.append(i)
+            start = i + len(t)
+    if not hits:
+        return text[: budget - 3].rstrip() + "..."
+    hits.sort()
+
+    # Slide a budget-sized window; keep the one covering the most term hits
+    # (densest relevant region). Anchor each candidate slightly before a hit so
+    # the clause's lead-in is included.
+    lead = budget // 5
+    best_start, best_count = 0, -1
+    for h in hits:
+        s = max(0, min(h - lead, len(text) - budget))
+        e = s + budget
+        cnt = 0
+        for x in hits:
+            if x >= e:
+                break
+            if x >= s:
+                cnt += 1
+        if cnt > best_count:
+            best_count, best_start = cnt, s
+    start = best_start
+    end = min(len(text), start + budget)
+    out = text[start:end].strip()
+    if start > 0:
+        out = "..." + out
+    if end < len(text):
+        out = out + "..."
+    return out
+
+
+def _authority_tier(c: dict) -> str:
+    """Authority class from the source path. NOT a flat rank -- it feeds a
+    FIELD-PREEMPTION analysis (see CROSS_JURISDICTION_NOTE): which class governs
+    depends on the subject. Classes:
+      STATE          -- NC statutes (NCGS) + NC State Building Code (primary law)
+      LOCAL          -- Durham UDO / county ordinance text (primary local law)
+      LOCAL-GUIDANCE -- durhamnc.gov agency how-to pages (interpretive, NOT law)
+      MODEL          -- IBC/IRC/... model codes (background unless adopted)
+      FEDERAL        -- federal (ADA/FEMA/NFIP) primary law
+    Derived structurally so the synthesis can be told which instrument controls.
+    """
+    p = (c.get("path") or "").replace("\\", "/").lower()
+    head = p.split("/", 1)[0]
+    if head.startswith("durham"):
+        # The scraped UDO ordinance HTML is primary local law; the other
+        # durhamnc.gov inspection pages are agency guidance (not law).
+        if "/inspections/" in p and "/udo-" not in p:
+            return "LOCAL-GUIDANCE"
+        return "LOCAL"
+    if head in ("north-carolina", "nc-state", "ncdot"):
+        return "STATE"
+    if head == "model":
+        return "MODEL"
+    if head == "federal":
+        return "FEDERAL"
+    return "OTHER"
 
 
 def _chunk_label(c: dict) -> str:
     """Human-readable provenance for a retrieved section."""
-    parts = [c.get("source_file") or "unknown"]
+    edition = c.get("edition") or c.get("jurisdiction")
+    parts = ["[%s]" % _authority_tier(c)]
+    if edition:
+        parts.append(str(edition))
+    parts.append(c.get("source_file") or "unknown")
     num = c.get("section_number")
     title = c.get("section_title")
     head = " ".join(x for x in (num, title) if x)
@@ -112,17 +260,54 @@ def _chunk_label(c: dict) -> str:
     return label
 
 
-def _build_chunks_block(chunks: list[dict]) -> str:
+def _designation(c: dict) -> str:
+    """Concise statute/section designation for the citation list.
+
+    e.g. "NC Residential Code R101.2.1 Accessory buildings -- NCRC2024... p.-"
+    Falls back to the source file + page when a section number is absent.
+    """
+    edition = c.get("edition") or c.get("jurisdiction") or ""
+    num = c.get("section_number")
+    title = (c.get("section_title") or "").rstrip(". ")
+    head = " ".join(x for x in (num, title) if x)
+    lead = " ".join(x for x in (str(edition), ("§ " + head) if head else "") if x)
+    src = c.get("source_file") or "unknown"
+    page = c.get("page")
+    tail = src + (" p.%s" % page if page is not None else "")
+    return (lead + " -- " + tail).strip(" -") if lead else tail
+
+
+def _authorities(chunks: list[dict], citations: list[int]) -> list[dict]:
+    """Map each cited [N] to a spelled-out authority designation."""
+    out = []
+    for n in citations:
+        if 1 <= n <= len(chunks):
+            c = chunks[n - 1]
+            out.append({
+                "n": n,
+                "designation": _designation(c),
+                "section_number": c.get("section_number"),
+                "section_title": c.get("section_title"),
+                "edition": c.get("edition"),
+                "jurisdiction": c.get("jurisdiction"),
+                "source_file": c.get("source_file"),
+                "page": c.get("page"),
+            })
+    return out
+
+
+def _build_chunks_block(chunks: list[dict], query: str | None = None) -> str:
     """Numbered chunk block with a per-section and total context budget.
 
-    Parent-document sections can be large, so cap each one and tighten later
-    chunks once the running total passes TOTAL_CONTEXT_BUDGET -- prevents prompt
-    bloat / cost blowups while keeping the top hits full."""
+    Parent-document sections can be large, so cap each one (query-aware window,
+    not a head cut) and tighten later chunks once the running total passes
+    TOTAL_CONTEXT_BUDGET -- prevents prompt bloat / cost blowups while keeping
+    the top hits' operative clauses intact."""
     lines = []
     total = 0
     for i, c in enumerate(chunks, start=1):
-        budget = CHUNK_CHAR_BUDGET if total < TOTAL_CONTEXT_BUDGET else 400
-        snippet = _truncate_chunk_text(c.get("text") or "", budget)
+        budget = CHUNK_CHAR_BUDGET if total < TOTAL_CONTEXT_BUDGET else 600
+        snippet = _truncate_chunk_text(c.get("text") or "", budget, query)
         total += len(snippet)
         lines.append('[%d] %s\n"%s"' % (i, _chunk_label(c), snippet))
     return "\n\n".join(lines)
@@ -182,7 +367,10 @@ def _chat_with_backoff(client, deployment: str, messages: list[dict]):
         except Exception as e:  # noqa: BLE001
             msg = str(e)
             lower = msg.lower()
-            if "429" in msg or "rate" in lower or "throttle" in lower:
+            transient = ("429" in msg or "rate" in lower or "throttle" in lower
+                         or any(c in msg for c in (" 500", " 502", " 503", " 504"))
+                         or "server_error" in lower or "overloaded" in lower)
+            if transient:
                 time.sleep(delay)
                 delay = min(delay * 2, MAX_DELAY_S)
                 continue
@@ -236,7 +424,7 @@ def answer(corpus: str, query: str, history: list[dict] | None = None,
     from .facets import answer_location
     cross_note = CROSS_JURISDICTION_NOTE % answer_location(location)
     system_prompt = SYSTEM_PROMPT + (cross_note if applied_balance else "")
-    chunks_block = _build_chunks_block(chunks)
+    chunks_block = _build_chunks_block(chunks, query)
     user_prompt = USER_PROMPT_TEMPLATE.format(query=query, chunks_block=chunks_block)
 
     global _LAST_PROMPT
@@ -252,7 +440,7 @@ def answer(corpus: str, query: str, history: list[dict] | None = None,
     messages.append({"role": "user", "content": user_prompt})
 
     client = _chat_client()
-    deployment = settings.chat_deployment_fast()
+    deployment = settings.chat_deployment_synthesis()
     resp = _chat_with_backoff(client, deployment, messages)
 
     try:
@@ -278,5 +466,6 @@ def answer(corpus: str, query: str, history: list[dict] | None = None,
         return out
 
     return {"answer": answer_text, "citations": citations, "chunks": chunks,
+            "authorities": _authorities(chunks, citations),
             "refused": False, "refusal_reason": None, "status": "ok",
             "tokens": tokens, "balanced": applied_balance}

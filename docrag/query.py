@@ -44,7 +44,14 @@ LOW_CONFIDENCE_RERANK = 0.02
 MAX_REF_EXPANSION = 3     # extra cross-referenced sections per query
 _REF_SCORE = -1.0         # sentinel: expansion sections sort last, ignore in stats
 
-_SHORT_CODE_RE = re.compile(r"^(?=[A-Z0-9]{2,8}$)[A-Z0-9]*[A-Z][A-Z0-9]*$")
+# A "short code" is an explicit provision/section/table identifier the user
+# typed (e.g. R705, 160D, E3902) that we then REQUIRE in the results to suppress
+# hallucination. It must mix a LETTER and a DIGIT: pure-alpha uppercase tokens
+# ("NC", "IBC", "ADA") are abbreviations and pure-digit tokens ("20", "000" from
+# "$20,000") are quantities -- neither is a section number, and hard-filtering
+# on them wrongly empties the candidate pool (e.g. dropping R101.2.1 for a query
+# that merely says "in Durham, NC" or "$20,000").
+_SHORT_CODE_RE = re.compile(r"^(?=[A-Z0-9]{2,8}$)(?=.*[A-Z])(?=.*\d)[A-Z0-9]+$")
 _FTS_SYNTAX_RE = re.compile(r'[\"\(\)\*\:\^]')
 
 # Jurisdiction buckets for the building-codes corpus (model / state / local).
@@ -162,9 +169,92 @@ def _expand_refs_enabled() -> bool:
     return val not in ("0", "false", "no", "off")
 
 
+def _expand_query_enabled() -> bool:
+    val = (settings.get("DOCRAG_EXPAND_QUERY", "1") or "1").strip().lower()
+    return val not in ("0", "false", "no", "off")
+
+
+_EXPAND_N = 3
+_EXPAND_SYS = (
+    "You rewrite a user's question into alternative search queries that use the "
+    "formal terminology found in building codes, statutes, and zoning "
+    "ordinances. A code rarely uses lay words: a 'shed' is a 'detached "
+    "accessory structure/building'; 'do I need a permit' maps to 'permit "
+    "exemption / work not requiring a permit / when a permit is required'; "
+    "'cost' maps to thresholds. Output exactly %d concise alternative queries, "
+    "one per line, no numbering, no commentary -- each a different phrasing or "
+    "the technical class names a code would use for the subject."
+) % _EXPAND_N
+
+
+def _expand_queries(query: str) -> list[str]:
+    """LLM paraphrases of the question into code-vocabulary search queries.
+
+    Bridges the lay-vs-code vocabulary gap so a rule phrased as a scope/exemption
+    (e.g. R101.2.1 'Accessory buildings') is recalled even when the user says
+    'shed'. Returns [] on any failure / when disabled -- retrieval then proceeds
+    on the original query alone (graceful degradation). Generic: no per-question
+    rules, the model generates the alternatives."""
+    if not _expand_query_enabled() or not query:
+        return []
+    try:
+        from openai import AzureOpenAI  # type: ignore
+        endpoint = settings.azure_endpoint()
+        api_key = settings.azure_api_key()
+        if not endpoint or not api_key:
+            return []
+        client = AzureOpenAI(azure_endpoint=endpoint, api_key=api_key,
+                             api_version=settings.azure_api_version())
+        resp = client.chat.completions.create(
+            model=settings.chat_deployment_synthesis(),
+            messages=[{"role": "system", "content": _EXPAND_SYS},
+                      {"role": "user", "content": query}],
+            max_completion_tokens=160,
+        )
+        text = (resp.choices[0].message.content or "").strip()
+    except Exception:  # noqa: BLE001 -- any LLM/transport failure -> no expansion
+        return []
+    out = []
+    for ln in text.splitlines():
+        ln = ln.strip().lstrip("0123456789.)-* \t").strip()
+        if ln and ln.lower() != query.lower():
+            out.append(ln)
+    return out[:_EXPAND_N]
+
+
+def _fuse_one(conn, qtext: str, vlim: int, blim: int) -> dict[int, float]:
+    """Vector + BM25 -> RRF leaf scores for a single query string."""
+    fused: dict[int, float] = {}
+    qvec = embed_one(qtext)
+    vec_rows = conn.execute(
+        "SELECT chunk_id FROM vec_chunks WHERE embedding MATCH ? "
+        "ORDER BY distance LIMIT ?", (_pack_vec(qvec), vlim),
+    ).fetchall()
+    for i, r in enumerate(vec_rows):
+        fused[r[0]] = fused.get(r[0], 0.0) + 1.0 / (RRF_K + i + 1)
+    fts_match = _fts_query(qtext)
+    if fts_match:
+        try:
+            fts_rows = conn.execute(
+                "SELECT rowid FROM fts_chunks WHERE fts_chunks MATCH ? "
+                "ORDER BY bm25(fts_chunks, 1.0, 0.3) LIMIT ?", (fts_match, blim),
+            ).fetchall()
+            for i, r in enumerate(fts_rows):
+                fused[r[0]] = fused.get(r[0], 0.0) + 1.0 / (RRF_K + i + 1)
+        except Exception:  # noqa: BLE001 -- malformed FTS, vec-only
+            pass
+    return fused
+
+
 def rag_query(corpus: str, query: str, top_k: int = 8,
-              filters: dict | None = None, balance: bool = False) -> dict:
-    """Hybrid retrieve + rerank + parent-collapse top_k sections for ``query``."""
+              filters: dict | None = None, balance: bool = False,
+              expand: bool = True) -> dict:
+    """Hybrid retrieve + rerank + parent-collapse top_k sections for ``query``.
+
+    ``expand`` controls the built-in LLM query expansion. The agentic layer
+    (reason.py) does its own hypothesis-directed expansion, so it calls with
+    ``expand=False`` to avoid a redundant paraphrase round.
+    """
     query = (query or "").strip()
     if not query:
         return {"status": "no_results", "results": [], "balanced": False}
@@ -178,32 +268,16 @@ def rag_query(corpus: str, query: str, top_k: int = 8,
 
     conn = open_db(corpus)
     try:
-        # --- Vector + BM25 -> RRF over leaves -------------------------------
-        qvec = embed_one(query)
-        vec_rows = conn.execute(
-            "SELECT chunk_id FROM vec_chunks WHERE embedding MATCH ? "
-            "ORDER BY distance LIMIT ?", (_pack_vec(qvec), vlim),
-        ).fetchall()
-        vec_rank = {r[0]: i + 1 for i, r in enumerate(vec_rows)}
-
-        bm25_rank: dict[int, int] = {}
-        fts_match = _fts_query(query)
-        if fts_match:
-            try:
-                fts_rows = conn.execute(
-                    "SELECT rowid FROM fts_chunks WHERE fts_chunks MATCH ? "
-                    "ORDER BY bm25(fts_chunks, 1.0, 0.3) LIMIT ?",
-                    (fts_match, blim),
-                ).fetchall()
-                bm25_rank = {r[0]: i + 1 for i, r in enumerate(fts_rows)}
-            except Exception:  # noqa: BLE001 -- malformed FTS, vec-only
-                bm25_rank = {}
-
+        # --- Multi-query: original + LLM code-vocabulary paraphrases --------
+        # Bridges the lay-vs-code vocabulary gap (e.g. "shed" -> "accessory
+        # building") so scope/exemption rules are recalled regardless of how
+        # the user phrases the question. Each query contributes vector+BM25 RRF;
+        # scores are summed (RRF over all query x retriever rankings).
+        queries = [query] + (_expand_queries(query) if expand else [])
         fused: dict[int, float] = {}
-        for cid, rank in vec_rank.items():
-            fused[cid] = fused.get(cid, 0.0) + 1.0 / (RRF_K + rank)
-        for cid, rank in bm25_rank.items():
-            fused[cid] = fused.get(cid, 0.0) + 1.0 / (RRF_K + rank)
+        for qtext in queries:
+            for cid, score in _fuse_one(conn, qtext, vlim, blim).items():
+                fused[cid] = fused.get(cid, 0.0) + score
         if not fused:
             return {"status": "no_results", "results": [], "balanced": False}
 
@@ -230,6 +304,15 @@ def rag_query(corpus: str, query: str, top_k: int = 8,
         if filters.get("file_glob"):
             g = filters["file_glob"]
             leaves = [r for r in leaves if fnmatch.fnmatch(r.get("source_file") or "", g)]
+        # Source include/omit (UI toggle): drop chunks whose path matches any
+        # excluded prefix/glob. Lets the user mute whole source groups (e.g. the
+        # durhamnc.gov agency-guidance pages) without reindexing.
+        if filters.get("exclude_globs"):
+            pats = filters["exclude_globs"]
+            def _excluded(r):
+                pp = (r.get("path") or "").replace("\\", "/")
+                return any(pp.startswith(g) or fnmatch.fnmatch(pp, g) for g in pats)
+            leaves = [r for r in leaves if not _excluded(r)]
 
         # Location (jurisdiction tier) + version (per-document edition) filters.
         if _filtered:

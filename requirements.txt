@@ -3,11 +3,22 @@ sqlite-vec>=0.1.6
 python-dotenv>=1.0.0
 PyPDF2>=3.0.0
 pycryptodome>=3.20.0          # AES-encrypted PDF decryption (PyPDF2 backend)
+PyMuPDF>=1.24.0               # fast, clean PDF text extraction for scraper/scrape_ncosfm.py
+                             # (PyPDF2 inserts spurious mid-word spaces; PyPDF2 is the fallback)
 python-docx>=1.1.0
 beautifulsoup4>=4.12.0
 lxml>=5.0.0
 
-# Optional: cross-encoder reranker (highest-ROI retrieval upgrade). If absent,
-# retrieval degrades gracefully to RRF order (see docrag/rerank.py). Pulls torch.
-# Install with:  pip install FlagEmbedding
-# FlagEmbedding>=1.2.0
+# Cross-encoder reranker (highest-ROI retrieval upgrade). If absent, retrieval
+# degrades gracefully to RRF order (see docrag/rerank.py). Pulls torch.
+# transformers is pinned <5: FlagEmbedding's FlagReranker uses the slow-tokenizer
+# prepare_for_model path, which transformers 5.x removed (raises
+# "XLMRobertaTokenizer has no attribute prepare_for_model").
+FlagEmbedding>=1.2.0
+transformers>=4.40,<5
+
+# Structure-aware PDF parsing: a trained layout model (DocLayNet) recovers the
+# heading hierarchy from PDFs so legal/code documents chunk into a section tree
+# instead of page blobs (see docrag/extractors.py: extract_pdf_docling). If
+# absent, PDF extraction falls back to the regex/page-chunk path.
+docling>=2.0.0

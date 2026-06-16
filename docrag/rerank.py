@@ -30,8 +30,23 @@ _TRIED = False
 
 
 def _enabled() -> bool:
-    val = (settings.get("DOCRAG_RERANK", "1") or "1").strip().lower()
-    return val not in ("0", "false", "no", "off")
+    """Reranker gate. Default 'auto': enable only when a CUDA GPU is present.
+
+    The cross-encoder (bge-reranker-v2-m3, an XLM-RoBERTa-large) is minutes-slow
+    per query on CPU -- impractical for interactive use -- so on CPU we default
+    to off and let hybrid RRF stand. Force it on/off explicitly with
+    DOCRAG_RERANK=1 / DOCRAG_RERANK=0 (honored even on CPU).
+    """
+    val = (settings.get("DOCRAG_RERANK", "auto") or "auto").strip().lower()
+    if val in ("0", "false", "no", "off"):
+        return False
+    if val in ("1", "true", "yes", "on"):
+        return True
+    try:  # auto
+        import torch  # type: ignore
+        return bool(torch.cuda.is_available())
+    except Exception:  # noqa: BLE001 -- torch absent -> CPU -> off
+        return False
 
 
 def _model_name() -> str:
@@ -49,8 +64,16 @@ def _load():
         return _MODEL
     try:
         from FlagEmbedding import FlagReranker  # type: ignore
-        _MODEL = FlagReranker(_model_name(), use_fp16=True)
-        sys.stderr.write("[rerank] loaded %s\n" % _model_name())
+        # fp16 only helps on CUDA; on CPU it is emulated and pathologically slow
+        # (each rerank takes minutes). Use fp16 only when a GPU is present.
+        use_fp16 = False
+        try:
+            import torch  # type: ignore
+            use_fp16 = bool(torch.cuda.is_available())
+        except Exception:  # noqa: BLE001 -- torch absent / probe failed -> CPU
+            use_fp16 = False
+        _MODEL = FlagReranker(_model_name(), use_fp16=use_fp16)
+        sys.stderr.write("[rerank] loaded %s (fp16=%s)\n" % (_model_name(), use_fp16))
     except Exception as exc:  # noqa: BLE001 -- dep absent / model download failed
         sys.stderr.write("[rerank] unavailable (%s); RRF order kept\n" % exc)
         _MODEL = False

@@ -16,12 +16,17 @@ chunks and to cite every claim with `[N]`.
 
 ## Setup
 
+Dependencies are installed with [uv](https://docs.astral.sh/uv/):
+
 ```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-copy .env.example .env   # then fill in your Azure OpenAI keys
+uv venv                                  # create .venv (Python 3.10+)
+uv pip install -r requirements.txt
+copy .env.example .env                   # then fill in your Azure OpenAI keys
 ```
+
+`uv` auto-uses `.venv` for subsequent `uv pip` / `uv run` calls, so no manual
+activation is needed. To run a one-off without activating: `uv run python -m
+docrag.ask "..."`. (If you prefer the venv on PATH: `.\.venv\Scripts\Activate.ps1`.)
 
 Requires Python 3.10+ and an Azure OpenAI resource with one embedding
 deployment and one chat deployment.
@@ -142,11 +147,19 @@ Dense, cross-referenced code/legal text needs more than flat chunking. The
 pipeline:
 
 - **Structure-aware chunking.** HTML code books are parsed into their
-  `<section>` tree (number, title, breadcrumb, parent); PDFs use per-jurisdiction
-  heading detection with a monotonicity check (falling back to page chunks when
-  structure is weak). Each smallest section is an embedded **leaf**; each section
-  is also stored as a **parent-document node** whose `full_text` = own body + all
-  descendants.
+  `<section>` tree (number, title, breadcrumb, parent); PDFs are parsed by a
+  trained layout model (**Docling** / DocLayNet) that recovers the heading
+  hierarchy and feeds the same section-tree path -- so statutes like NCGS
+  160D-1110 become real sections instead of page blobs (large PDFs are processed
+  in page batches to bound memory; falls back to page chunks if Docling is
+  unavailable or finds no headings). Each smallest section is an embedded
+  **leaf**; each section is also a **parent-document node** whose `full_text` =
+  own body + all descendants.
+- **Multi-query expansion.** The user question is paraphrased (LLM) into the
+  formal terminology a code uses ("shed" -> "detached accessory structure";
+  "do I need a permit" -> "work exempt from permit"), and every phrasing
+  contributes vector+BM25 RRF -- so a rule phrased as a scope/exemption is
+  recalled even when the user asks in lay terms. Toggle `DOCRAG_EXPAND_QUERY=0`.
 - **Metadata enrichment.** Every leaf's embedding input is prefixed with
   `edition | breadcrumb | § number title | jurisdiction`, and that string is
   indexed in a separate BM25 column (down-weighted vs. body) so exact-section
@@ -160,14 +173,38 @@ pipeline:
 - **Adaptive jurisdiction balance.** Interleaves model/state/local only when no
   single jurisdiction dominates the top hits.
 
-**Optional reranker** (recommended; biggest single accuracy lever):
+**Cross-encoder reranker** (`FlagEmbedding`, installed by `requirements.txt`):
+defaults to `DOCRAG_RERANK=auto` -- enabled only when a CUDA GPU is present. On
+CPU the model (`bge-reranker-v2-m3`) is minutes-slow per query *and* tends to
+demote scope/exemption rules that don't surface-match the question, so CPU
+deployments run hybrid RRF alone. Force it with `DOCRAG_RERANK=1` / disable with
+`DOCRAG_RERANK=0` (honored even on CPU). If the model can't load, retrieval
+degrades gracefully to RRF order. Cross-reference expansion: `DOCRAG_EXPAND_REFS=0`.
 
-```powershell
-pip install FlagEmbedding   # pulls torch; model auto-downloads on first query
-```
+## Agentic answering (hypothesize -> verify)
 
-If it's not installed, retrieval degrades gracefully to RRF order. Toggle with
-`DOCRAG_RERANK=0`; cross-reference expansion with `DOCRAG_EXPAND_REFS=0`.
+For the balanced `building-codes` corpus, answers go through a multi-step
+reasoning pipeline (`docrag/reason.py`) instead of a single synthesis call --
+correctness over latency:
+
+1. **Understand + hypothesize** (LLM, JSON): clean the question, extract the
+   decision-relevant facts (structure type, dimensions, cost, jurisdiction),
+   state a common-sense hypothesis, and list the provisions + code-vocabulary
+   search probes that would confirm or refute it.
+2. **Retrieve** (no LLM): run retrieval on the cleaned query + every probe; fuse
+   the per-probe section rankings (RRF).
+3. **Verify + answer** (LLM): confirm / refute / refine the hypothesis against
+   the retrieved provisions and produce the final grounded, cited answer. If the
+   verifier names a rule it still needs, do one more targeted retrieve and
+   re-answer (bounded loop).
+
+The hypothesis is private scaffolding -- it directs the search; the corpus
+decides the answer (the final answer stays grounded + cited, so the model's
+prior can't leak in as an uncited claim). State/local provisions take
+precedence over the model code where they address the same subject. Toggle with
+`DOCRAG_AGENTIC=0` (falls back to the single-pass `answer.py` path). The web UI
+and `docrag.ask` use it by default for `building-codes`; `python -m docrag.eval
+--corpus building-codes --agentic` evaluates it.
 
 ## Evaluation
 
@@ -200,6 +237,7 @@ docrag/
   db.py          SQLite + sqlite-vec + FTS5 + section_nodes + section_refs (one DB per corpus)
   query.py       hybrid + RRF + rerank + parent-collapse + citation-graph expansion
   answer.py      grounded synthesis with [N] citations, budget guard + refusal gate
+  reason.py      agentic hypothesize->verify pipeline over answer.py (building-codes)
   index.py       build / status / purge CLI (+ citation-graph resolution)
   eval.py        section-grounded retrieval + answer evaluation
 server/

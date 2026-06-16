@@ -22,6 +22,7 @@ from .extractors import (
     extract_doc,
     extract_docx,
     extract_html,
+    extract_pdf_docling,
     extract_pdf_pages,
     sanitize_ascii,
 )
@@ -205,9 +206,34 @@ def extract_file(file_entry: dict) -> dict:
         return result
 
     if ext == _EXT_PDF:
+        # Structure-aware first: a trained layout model recovers the heading
+        # hierarchy so the PDF chunks into a section tree (same path as HTML
+        # code books) instead of opaque page blobs. Falls back to page chunks
+        # when Docling is unavailable or finds no headings.
+        sections = None
+        try:
+            sections = extract_pdf_docling(safe_abs)
+        except Exception as e:  # noqa: BLE001 -- never let parsing crash the build
+            sys.stderr.write("[extract] %s: docling error %s\n" % (file_entry["path"], e))
+            sections = None
+        if sections:
+            for s in sections:
+                s["own_text"] = sanitize_ascii(s.get("own_text") or "")
+                s["full_text"] = sanitize_ascii(s.get("full_text") or "")
+                s["section_title"] = sanitize_ascii(s.get("section_title") or "") or None
+            result["kind"] = "html_sections"   # reuse the structure-aware chunker
+            result["sections"] = sections
+            total = sum(len(s["own_text"]) for s in sections)
+            result["page_count"] = len(sections)
+            result["no_text"] = total == 0
+            if not result["no_text"]:
+                return result
+            # Structure found but no text extracted -> fall through to pages.
+
         page_tuples = extract_pdf_pages(safe_abs) or []
         pages_text = [pt[1] for pt in page_tuples]
         result["kind"] = "pdf"
+        result["sections"] = None
         result["pages"] = pages_text
         result["page_count"] = len(pages_text)
         result["no_text"] = sum(len(p.strip()) for p in pages_text) == 0

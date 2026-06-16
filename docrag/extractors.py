@@ -15,6 +15,7 @@ Public API:
 from __future__ import annotations
 
 import html as _html
+import os
 import re
 import sys
 
@@ -94,6 +95,180 @@ def extract_pdf_pages(pdf_path: str) -> list[tuple[int, str]]:
             text = ""
         pages.append((i + 1, sanitize_ascii(text)))
     return pages
+
+
+# -- PDF (structure-aware, layout model) ---------------------------------------
+
+# Cosmetic only: split an ALREADY-identified heading into (number, title) so
+# citations can read "§ 160D-1110 Building permits". This does NOT find
+# headings -- the layout model does that. number=None when no leading
+# code/statute-style token is present (the whole heading becomes the title).
+_HEADING_SPLIT_RE = re.compile(
+    r"^\s*(?:§\s*)?([A-Z]{0,4}\d[\w.\-]*?)\.?\s+(.*\S)?\s*$")
+
+
+def _split_heading(text: str):
+    text = " ".join((text or "").split())
+    m = _HEADING_SPLIT_RE.match(text)
+    if m and any(ch.isdigit() for ch in m.group(1)):
+        return m.group(1), (m.group(2) or None)
+    return None, (text or None)
+
+
+def extract_pdf_docling(pdf_path: str):
+    """Recover a PDF's heading hierarchy with a trained layout model (Docling).
+
+    Returns a ``sections`` list in the SAME shape as ``extract_html`` --
+    ``[{section_id, section_number, section_title, parent_section_id, level,
+    own_text, full_text, has_table, page}]`` -- so the caller routes it through
+    the existing structure-aware (HTML) chunking path. Returns ``None`` when
+    Docling is unavailable, conversion fails, or no headings are detected (the
+    caller then falls back to page-chunking). Text is raw; caller sanitizes.
+    """
+    # On Windows the HF cache uses symlinks by default, which fails without
+    # admin/developer mode (WinError 1314). Force plain-copy caching.
+    os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS", "1")
+    os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
+
+    try:
+        from docling.document_converter import DocumentConverter  # type: ignore
+    except Exception as exc:  # noqa: BLE001 -- dep absent
+        sys.stderr.write("[extract] docling unavailable (%s); page fallback\n" % exc)
+        return None
+
+    # Disable OCR: these are born-digital code/statute PDFs with a real text
+    # layer, so OCR is wasteful (slow + extra model downloads) and less
+    # accurate than the embedded text. Keep table-structure recovery on.
+    try:
+        from docling.datamodel.base_models import InputFormat  # type: ignore
+        from docling.datamodel.pipeline_options import PdfPipelineOptions  # type: ignore
+        from docling.document_converter import PdfFormatOption  # type: ignore
+        _opts = PdfPipelineOptions(do_ocr=False, do_table_structure=True)
+        _converter = DocumentConverter(
+            format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=_opts)})
+    except Exception as exc:  # noqa: BLE001 -- API drift -> defaults
+        sys.stderr.write("[extract] docling options unavailable (%s); defaults\n" % exc)
+        _converter = DocumentConverter()
+
+    def _label(item) -> str:
+        lab = getattr(item, "label", "")
+        return getattr(lab, "value", str(lab)).lower()
+
+    def _page_of(item):
+        prov = getattr(item, "prov", None) or []
+        if prov:
+            return getattr(prov[0], "page_no", None)
+        return None
+
+    def _table_md(item, text):
+        try:
+            return item.export_to_dataframe().to_markdown(index=False)
+        except Exception:  # noqa: BLE001 -- older docling / no pandas
+            return text or ""
+
+    # The layout model renders each page to an image; doing all pages at once
+    # exhausts memory on large statutes (std::bad_alloc). Process in bounded
+    # page batches to cap peak memory. A section that spans a batch boundary
+    # keeps accumulating because the heading stack persists across batches, and
+    # page numbers from page_range are absolute. Normalize items to plain tuples
+    # (label, text, page, level) so docling objects are freed between batches.
+    try:
+        import PyPDF2  # type: ignore
+        n_pages = len(PyPDF2.PdfReader(pdf_path).pages)
+    except Exception:  # noqa: BLE001
+        n_pages = None
+
+    BATCH = 16
+    items: list[tuple] = []
+
+    def _collect(doc):
+        for entry in doc.iterate_items():
+            it = entry[0] if isinstance(entry, tuple) else entry
+            lab = _label(it)
+            text = _table_md(it, getattr(it, "text", None)) if lab == "table" \
+                else getattr(it, "text", None)
+            items.append((lab, text, _page_of(it), getattr(it, "level", None)))
+
+    try:
+        if n_pages and n_pages > BATCH:
+            for start in range(1, n_pages + 1, BATCH):
+                end = min(start + BATCH - 1, n_pages)
+                try:
+                    d = _converter.convert(pdf_path, page_range=(start, end)).document
+                    _collect(d)
+                    del d
+                except Exception as exc:  # noqa: BLE001 -- skip a bad batch, keep going
+                    sys.stderr.write("[extract] docling batch %d-%d failed (%s)\n"
+                                     % (start, end, exc))
+        else:
+            _collect(_converter.convert(pdf_path).document)
+    except Exception as exc:  # noqa: BLE001
+        sys.stderr.write("[extract] docling convert failed (%s); page fallback\n" % exc)
+        return None
+
+    if not items:
+        return None
+
+    # Walk items in reading order; headings open sections, text/tables append to
+    # the current section. A stack keyed by heading level gives parent links.
+    nodes: dict[str, dict] = {}
+    order: list[str] = []
+    stack: list[tuple[int, str]] = []  # (heading_level, section_id)
+    counter = 0
+
+    for lab, text, page, lvl in items:
+        if lab in ("title", "section_header", "page_header"):
+            level = lvl if isinstance(lvl, int) else (1 if lab != "title" else 0)
+            counter += 1
+            sid = "sec%04d" % counter
+            num, title = _split_heading(text or "")
+            while stack and stack[-1][0] >= level:
+                stack.pop()
+            parent_id = stack[-1][1] if stack else None
+            nodes[sid] = {
+                "section_id": sid, "section_number": num,
+                "section_title": title, "parent_section_id": parent_id,
+                "level": level, "own_text_parts": [], "has_table": False,
+                "page": page,
+            }
+            order.append(sid)
+            stack.append((level, sid))
+        else:
+            if not stack:
+                continue  # preamble before the first heading -- skip
+            cur = nodes[stack[-1][1]]
+            if lab == "table":
+                cur["has_table"] = True
+            if text:
+                cur["own_text_parts"].append(text)
+
+    if not order:
+        return None
+
+    for sid in order:
+        nodes[sid]["own_text"] = "\n".join(nodes[sid].pop("own_text_parts")).strip()
+
+    # full_text = own + all descendants (depth-first, document order).
+    children: dict[str, list[str]] = {}
+    for sid in order:
+        p = nodes[sid]["parent_section_id"]
+        if p in nodes:
+            children.setdefault(p, []).append(sid)
+
+    def _full(sid: str) -> str:
+        parts = [nodes[sid]["own_text"]] if nodes[sid]["own_text"] else []
+        for ch in children.get(sid, []):
+            ft = _full(ch)
+            if ft:
+                parts.append(ft)
+        return "\n\n".join(parts)
+
+    sections = []
+    for sid in order:
+        n = dict(nodes[sid])
+        n["full_text"] = _full(sid)
+        sections.append(n)
+    return sections
 
 
 # -- DOCX ----------------------------------------------------------------------

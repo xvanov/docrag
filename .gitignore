@@ -6,6 +6,7 @@ app.settings.json
 scraper/recon/
 **/cookies*.json
 **/login_status.json
+scraper/_ncosfm_cache/
 
 # Indexes + uploaded corpora (regenerable / large)
 .index/

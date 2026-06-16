@@ -137,3 +137,14 @@ def chat_deployment_fast() -> str:
 
 def chat_deployment() -> str:
     return get("AZURE_OPENAI_DEPLOYMENT", "gpt-4o-mini") or "gpt-4o-mini"
+
+
+def chat_deployment_synthesis() -> str:
+    """Deployment for grounded answer synthesis.
+
+    Synthesis must do real regulatory reasoning (apply thresholds / scope rules
+    to the question's facts, including the converse of a scope limiter), so it
+    defaults to the full chat deployment rather than the cheaper FAST one.
+    Override with AZURE_OPENAI_DEPLOYMENT_SYNTHESIS.
+    """
+    return get("AZURE_OPENAI_DEPLOYMENT_SYNTHESIS", "") or chat_deployment()

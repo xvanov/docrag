@@ -248,6 +248,7 @@ def _chunks_from_html(corpus, file_entry, extracted) -> dict:
         crumb = _breadcrumb(sid, by_id)
         full = (s.get("full_text") or "").strip()
         own = (s.get("own_text") or "").strip()
+        page = s.get("page")  # PDF (Docling) sections carry a page; HTML: None
         # Parent-document node (retrieval payload).
         nodes.append({
             "corpus": corpus, "path": rel_path, "jurisdiction": jurisdiction,
@@ -265,7 +266,7 @@ def _chunks_from_html(corpus, file_entry, extracted) -> dict:
                     corpus, rel_path, source_label, jurisdiction, edition,
                     section_id=sid, section_number=s.get("section_number"),
                     section_title=s.get("section_title"), breadcrumb=crumb,
-                    body=body, node_type=nt))
+                    body=body, page=page, node_type=nt))
             refs.extend(_refs_from_text(own, sid, corpus, rel_path))
     return {"chunks": chunks, "sections": nodes, "refs": refs}
 

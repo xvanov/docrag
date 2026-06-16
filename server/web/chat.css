@@ -55,6 +55,7 @@ a:hover { text-decoration: underline; }
   grid-template-columns: 264px 1fr;
   grid-template-rows: minmax(0, 1fr);
   height: 100vh;
+  height: 100dvh;   /* track mobile browser chrome (address bar / keyboard) */
   overflow: hidden;
   transition: grid-template-columns .22s ease;
 }
@@ -226,6 +227,12 @@ body.sidebar-collapsed .sidebar-toggle-floating { display: grid; }
 .sources-menu-item .src-juris { font-size: 11px; color: var(--accent-2); white-space: nowrap; }
 .sources-menu-item .src-count { font-family: var(--mono); font-size: 11px; color: var(--text-mute); white-space: nowrap; }
 .sources-menu-empty { color: var(--text-mute); font-size: 13px; padding: 6px 8px; }
+.sources-group-head { padding: 8px 10px 3px; margin-top: 4px; border-top: 1px solid var(--border); }
+.sources-group-head label { display: flex; align-items: center; gap: 7px; cursor: pointer;
+  font-size: 12px; font-weight: 650; text-transform: uppercase; letter-spacing: .03em; color: var(--text-dim); }
+.sources-group-head input { cursor: pointer; }
+.sources-menu-item.muted, .sources-group-head.muted label { opacity: .4; text-decoration: line-through; }
+.sources-menu-item .src-file { flex: 1; }
 
 /* ---- settings popover ------------------------------------------------ */
 .settings-wrap { position: relative; }
@@ -357,6 +364,28 @@ body.is-welcome #composer-dock-welcome { margin-top: 8px; }
   border-radius: 5px; padding: 0 4px; margin: 0 1px; vertical-align: baseline;
 }
 .cite:hover { background: rgba(91,143,214,.28); }
+
+/* spelled-out statute/section designations for the cited chunks */
+.authorities { margin: 10px 0 2px; padding: 9px 12px; background: var(--panel-2);
+  border: 1px solid var(--border); border-radius: 10px; }
+.authorities-title { font-size: 11.5px; font-weight: 650; text-transform: uppercase;
+  letter-spacing: .04em; color: var(--text-dim); margin-bottom: 5px; }
+.authorities-list { list-style: none; margin: 0; padding: 0; }
+.authorities-list .authority { font-size: 13px; line-height: 1.5; margin: 2px 0; }
+
+/* total generation time, shown under the finished answer */
+.answer-time {
+  display: inline-flex; align-items: center; gap: 6px;
+  margin-top: 10px; padding: 4px 10px;
+  font-size: 12px; color: var(--text-dim);
+  background: var(--panel-2); border: 1px solid var(--border-soft);
+  border-radius: 999px;
+}
+.answer-time svg {
+  width: 13px; height: 13px; flex: none;
+  fill: none; stroke: var(--accent-2); stroke-width: 1.8;
+  stroke-linecap: round; stroke-linejoin: round;
+}
 
 /* per-message meta line */
 .meta { font-size: 11.5px; color: var(--text-mute); font-family: var(--mono); margin-top: 6px; }
@@ -493,13 +522,76 @@ body.is-welcome #composer-dock-welcome { margin-top: 8px; }
 /* ====================================================================== */
 /* Responsive                                                              */
 /* ====================================================================== */
+
+/* Tap-to-close scrim behind the off-canvas sidebar -- desktop hides it. */
+.sidebar-backdrop { display: none; }
+
 @media (max-width: 860px) {
-  .app { grid-template-columns: 1fr; }
-  .sidebar { position: fixed; z-index: 80; width: 264px; height: 100vh; }
-  .sidebar.collapsed { margin-left: -264px; }
+  /* Sidebar becomes an off-canvas overlay; main pane spans full width. */
+  .app,
+  body.sidebar-collapsed .app { grid-template-columns: 1fr; }
+  .sidebar {
+    position: fixed; top: 0; left: 0; z-index: 80;
+    width: min(82vw, 300px); height: 100vh; height: 100dvh;
+    box-shadow: 0 0 40px rgba(0,0,0,.5);
+  }
+  .sidebar.collapsed { margin-left: calc(-1 * min(82vw, 300px)); }
+  /* Dimmed, tap-to-dismiss scrim while the sidebar is open. */
+  body:not(.sidebar-collapsed) .sidebar-backdrop {
+    display: block; position: fixed; inset: 0; z-index: 70;
+    background: rgba(0,0,0,.5);
+  }
+
+  /* Compact chrome. */
+  .topbar { padding: 9px 12px; gap: 8px; }
+  .topbar-left { gap: 8px; flex: 1; min-width: 0; }
+  .topbar-actions { gap: 6px; }
   .suggestions { grid-template-columns: 1fr; }
   .topbar-actions .action-btn span { display: none; }
-  .action-btn { padding: 0 9px; }
+  .action-btn { padding: 0 10px; }
+  .location-picker { margin-left: 4px; padding: 4px 6px; }
+  #location-select { max-width: 116px; }
+
+  /* Finger-sized touch targets (>=40px; iOS HIG is 44). */
+  .icon-btn, .action-btn, .corpus-picker-btn { height: 40px; }
+  .icon-btn { width: 40px; }
+  .send-btn { width: 44px; height: 44px; }
+
+  /* Inputs/selects >=16px so iOS doesn't auto-zoom on focus. */
+  #input, #location-select, #corpus-select, .version-select,
+  .form-row select, .form-row input[type=text], .form-row input[type=file] { font-size: 16px; }
+
+  /* Conversation + composer spacing; clear the iOS home indicator. */
+  .thread { padding: 16px 12px 6px; gap: 14px; }
+  .thread > *, .composer { max-width: 100%; }
+  .composer-dock-bottom { padding: 10px 12px calc(12px + env(safe-area-inset-bottom)); }
+  body.is-welcome #composer-dock-welcome { margin-top: 4px; }
+  .welcome-inner { padding: 18px 14px; }
+  #welcome-greeting { font-size: 26px; }
+  #welcome-sub { font-size: 14px; margin-bottom: 18px; }
+  .msg.user .bubble { max-width: 92%; }
+
+  /* Popovers must fit the viewport, not a fixed min-width. */
+  .corpus-picker-menu { min-width: 0; width: min(92vw, 320px); max-height: 70vh; }
+  .settings-menu { min-width: 0; width: min(80vw, 260px); }
+
+  /* Long answers (code blocks, markdown tables) scroll inside the bubble
+     instead of forcing the whole page to scroll sideways. */
+  .bubble pre { font-size: 12px; }
+  .bubble table { display: block; width: 100%; overflow-x: auto; }
+}
+
+/* Very small phones. */
+@media (max-width: 420px) {
+  .corpus-picker-btn .picker-count { display: none; }
+  #welcome-greeting { font-size: 23px; }
+  .suggestion { padding: 13px 14px; }
+}
+
+/* Respect reduced-motion: drop the slide/scroll animations. */
+@media (prefers-reduced-motion: reduce) {
+  .app, .sidebar { transition: none; }
+  .thread { scroll-behavior: auto; }
 }
 
 /* ---------- Location selector (global) ---------- */
@@ -520,6 +612,51 @@ body.is-welcome #composer-dock-welcome { margin-top: 8px; }
   max-width: 200px;
 }
 #location-select option { background: var(--panel); color: var(--text); }
+
+/* ====================================================================== */
+/* Cancel button + copy actions + sidebar job indicators                   */
+/* ====================================================================== */
+
+/* Send button flips to a red "stop" while its chat is generating. */
+.send-btn.stop { background: linear-gradient(180deg, #e07a7a, #d65f5f); }
+.send-btn.stop svg { fill: currentColor; stroke: none; }
+
+/* Copy button sits inside the message bubble's top-right corner. */
+.bubble, .refusal { position: relative; }
+.msg.user .bubble { padding-right: 42px; }
+.msg.assistant .bubble { padding-right: 32px; }
+.refusal { padding-right: 42px; }
+.copy-btn {
+  position: absolute; top: 6px; right: 6px; z-index: 2;
+  display: inline-grid; place-items: center; width: 26px; height: 26px;
+  border: 1px solid var(--border); border-radius: 8px;
+  background: rgba(20,20,27,.8); color: var(--text-mute);
+  opacity: 0; transition: opacity .12s ease, color .12s ease, border-color .12s ease;
+}
+.bubble:hover .copy-btn, .refusal:hover .copy-btn, .copy-btn:focus-visible { opacity: 1; }
+.copy-btn:hover { color: var(--text); border-color: #3a3a48; }
+.copy-btn.copied { color: var(--green); border-color: rgba(84,192,138,.5); opacity: 1; }
+.copy-btn svg { width: 14px; height: 14px; fill: none; stroke: currentColor;
+  stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+@media (max-width: 860px) { .copy-btn { opacity: .8; } }  /* no hover on touch */
+
+/* Sidebar: spinner while a chat is generating; bell + flash when it finishes. */
+.row-status { margin-left: auto; display: inline-flex; align-items: center; }
+.row-status.bell svg { width: 14px; height: 14px; fill: none; stroke: var(--accent-2);
+  stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
+.mini-spinner {
+  width: 11px; height: 11px; display: inline-block;
+  border: 2px solid rgba(255,255,255,.18); border-top-color: var(--accent-2);
+  border-radius: 50%; animation: spin .7s linear infinite;
+}
+/* Finished-in-background chat: brief flash, then a steady tint until opened. */
+.thread-row.attention { background: rgba(91,143,214,.12); animation: rowflash 1.4s ease; }
+.thread-row.attention .row-status.bell { animation: bellwiggle 1s ease; }
+@keyframes rowflash { 0% { background: rgba(91,143,214,.4); } 100% { background: rgba(91,143,214,.12); } }
+@keyframes bellwiggle {
+  0%,100% { transform: rotate(0); } 20% { transform: rotate(-12deg); }
+  40% { transform: rotate(10deg); } 60% { transform: rotate(-6deg); } 80% { transform: rotate(4deg); }
+}
 
 /* ---------- Per-document version (edition) selectors ---------- */
 .versions-section {

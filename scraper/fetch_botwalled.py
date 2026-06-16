@@ -58,67 +58,32 @@ HTML_MIN_BYTES = 20 * 1024  # 20 KB floor for HTML-only papers
 # candidate direct URLs (filenames observed in the wild / search results).
 AISC_HUB = "https://www.aisc.org/publications/steel-standards/"
 
-AISC_TARGETS = [
-    (
-        "https://www.aisc.org/Specification-for-Structural-Steel-Buildings-ANSIAISC-360-22-Download",
-        "ANSI-AISC-360-22-specification-structural-steel-buildings.pdf",
-        [
-            "https://www.aisc.org/globalassets/aisc/publications/standards/a360-22w.pdf",
-            "https://www.aisc.org/globalassets/product-files-not-searched/publications/standards/a360-22w.pdf",
-        ],
-    ),
-    (
-        "https://www.aisc.org/Seismic-Provisions-for-Structural-Steel-Buildings-ANSIAISC-341-22-Download",
-        "ANSI-AISC-341-22-seismic-provisions-structural-steel-buildings.pdf",
-        [
-            "https://www.aisc.org/globalassets/aisc/publications/standards/a341-22w.pdf",
-        ],
-    ),
-    (
-        "https://www.aisc.org/Prequalified-Connections-for-Special-and-Intermediate-Steel-Moment-Frames-for-Seismic-Applications-ANSIAISC-358-22-Download",
-        "ANSI-AISC-358-22-prequalified-connections-moment-frames.pdf",
-        [
-            "https://www.aisc.org/globalassets/aisc/publications/standards/a358-22w.pdf",
-        ],
-    ),
-    (
-        "https://www.aisc.org/Code-of-Standard-Practice-for-Steel-Buildings-and-Bridges-ANSIAISC-303-22-Download",
-        "ANSI-AISC-303-22-code-of-standard-practice.pdf",
-        [
-            "https://www.aisc.org/globalassets/aisc/publications/standards/a303-22w.pdf",
-        ],
-    ),
-]
+# DROPPED: AISC 360/341/358/303-22 are NOT free -- copyrighted, purchase/DRM only
+# (verified 2026-06-12). Only pirate copies exist; not touching those.
+AISC_TARGETS = []
 AISC_DIR = "methods/steel"
 
 # ---------------------------------------------------------------------------
 # Group 2: MDPI open-access (CC-BY) earthen-construction review papers.
 # PDF url = article url + "/pdf". All open access, CC-BY 4.0.
 # ---------------------------------------------------------------------------
+# Verified real + open-access (CC-BY) via WebSearch 2026-06-12.
 MDPI_TARGETS = [
     (
         "https://www.mdpi.com/2071-1050/16/2/670",
-        "MDPI-Sustainability-2024-properties-of-sustainable-earth-construction-materials-review.pdf",
-    ),
-    (
-        "https://www.mdpi.com/2075-5309/15/6/918",
-        "MDPI-Buildings-2025-sustainable-earthen-construction-meta-analytical-review.pdf",
+        "MDPI-Sustainability-2024-sustainable-earth-construction-materials-state-of-art-review.pdf",
     ),
     (
         "https://www.mdpi.com/2075-5309/16/8/1633",
-        "MDPI-Buildings-2026-compressed-stabilized-earth-blocks-systematic-review.pdf",
+        "MDPI-Buildings-compressed-stabilized-earth-blocks-prisma-systematic-review.pdf",
     ),
     (
-        "https://www.mdpi.com/2073-4360/17/9/1170",
-        "MDPI-Polymers-2025-bio-based-stabilization-rammed-earth-review.pdf",
+        "https://www.mdpi.com/2075-5309/15/23/4362",
+        "MDPI-Buildings-2025-carbon-conscious-compressed-stabilized-earth-blocks.pdf",
     ),
     (
-        "https://www.mdpi.com/2075-5309/11/8/367",
-        "MDPI-Buildings-2021-unstabilized-rammed-earth-mechanical-seismic-literature-review.pdf",
-    ),
-    (
-        "https://www.mdpi.com/1996-1073/14/8/2080",
-        "MDPI-Energies-2021-thermal-monitoring-simulation-earthen-buildings-review.pdf",
+        "https://www.mdpi.com/2075-5309/14/12/4034",
+        "MDPI-Buildings-2024-rammed-earth-architecture-case-study.pdf",
     ),
 ]
 MDPI_DIR = "methods/earthen-reviews"
@@ -127,28 +92,26 @@ MDPI_DIR = "methods/earthen-reviews"
 # Group 3: Cal-Earth / SuperAdobe free structural test reports.
 # Linked publicly from calearth.org "Resources for Builders".
 # ---------------------------------------------------------------------------
-CALEARTH_TARGETS = [
+# ICC-ES ESR-4126 = official code-compliance report for Cal-Earth SuperAdobe
+# (bridges earthbag -> "allowed"). Scrape the real PDF link off the ICC-ES page,
+# then try candidate direct CDN URLs as fallback.
+CALEARTH_PAGES = [
     (
-        # ICC-ES Evaluation Service Report for SuperAdobe cement-stabilized earthbags.
-        "https://www.dropbox.com/scl/fi/aulfqpdv8fn8sb4crl987/ESR-4126.pdf"
-        "?rlkey=ogo97au3fgt2u7vmwtlkm8tqa&dl=1",
+        "https://icc-es.org/report-listing/esr-4126/",
         "CalEarth-ICC-ES-ESR-4126-superadobe-evaluation-report.pdf",
-    ),
-    (
-        # Twinings Lab final structural test summary letter.
-        "https://static1.squarespace.com/static/575451b3d51cd4cfabfd8d77/t/"
-        "60cff737ea2dce2a10445d81/1624241986267/Cal-Earth+Final+Summary+Letter.pdf",
-        "CalEarth-Twining-Lab-final-structural-test-summary.pdf",
+        "4126",
+        [
+            "https://icc-es.org/wp-content/uploads/report-directory/ESR-4126.pdf",
+            "https://cdn-v2.icc-es.org/wp-content/uploads/report-directory/ESR-4126.pdf",
+        ],
     ),
 ]
 CALEARTH_DIR = "methods/earthbag"
 
 # Landing pages to warm up Cloudflare/Akamai clearance cookies per host.
 WARMUP_URLS = [
-    "https://www.aisc.org/",
-    AISC_HUB,
     "https://www.mdpi.com/",
-    "https://calearth.org/",
+    "https://icc-es.org/",
 ]
 
 
@@ -171,12 +134,30 @@ def _looks_like_html(body: bytes) -> bool:
         or b"<head" in head or b"<title" in head
 
 
+def _save_via_request(page, url: str, tmp: pathlib.Path) -> tuple[bool, str]:
+    """Fetch bytes via the browser context's APIRequestContext. Reuses the
+    Cloudflare clearance cookies banked during warm-up, and -- unlike page
+    navigation -- returns the body of an inline-served PDF directly."""
+    try:
+        host = f"{urlparse(url).scheme}://{urlparse(url).netloc}/"
+        resp = page.context.request.get(
+            url, headers={"Referer": host, "Accept": "application/pdf,*/*"},
+            timeout=90000,
+        )
+        if resp.status >= 400:
+            return False, f"http {resp.status}"
+        tmp.write_bytes(resp.body())
+        return True, "request"
+    except Exception as e:
+        return False, f"request error: {repr(e)[:120]}"
+
+
 def _save_via_download(page, url: str, tmp: pathlib.Path) -> tuple[bool, str]:
     """Drive Chromium so the PDF streams as a download (carries bot cookies)."""
     try:
-        with page.expect_download(timeout=120000) as dl_info:
+        with page.expect_download(timeout=60000) as dl_info:
             try:
-                page.goto(url, timeout=8000)
+                page.goto(url, timeout=15000)
             except Exception:
                 pass
         dl = dl_info.value
@@ -233,19 +214,26 @@ def fetch(page, url: str, dest: pathlib.Path, pdf: bool) -> tuple[bool, str]:
         return True, f"{len(body) // 1024} KB"
 
     def attempt() -> tuple[bool, str]:
+        # 1) APIRequestContext (best for inline-served PDFs behind Cloudflare).
+        ok0, how0 = _save_via_request(page, url, tmp)
+        if ok0:
+            good, detail = validate_and_store()
+            if good:
+                return True, detail
+        # 2) Chromium download event (for attachment-served PDFs).
         ok, how = _save_via_download(page, url, tmp)
         if ok:
             good, detail = validate_and_store()
             if good:
                 return True, detail
-        # Fall back to reading the navigation response body directly.
+        # 3) Navigation response body.
         ok2, how2 = _save_via_navigation(page, url, tmp)
         if ok2:
             good, detail = validate_and_store()
             if good:
                 return True, detail
             return False, detail
-        return False, how if not ok else how2
+        return False, how0 if not ok0 else (how if not ok else how2)
 
     ok, detail = attempt()
     if not ok:
@@ -264,14 +252,10 @@ def scrape_pdf_link(page, landing_url: str, must_match: str = "") -> str | None:
     """Open an AISC download landing page and return the first standard PDF
     anchor. must_match (e.g. '360') narrows to the right file when present."""
     try:
-        page.goto(landing_url, wait_until="networkidle", timeout=90000)
-        page.wait_for_timeout(1500)
+        page.goto(landing_url, wait_until="domcontentloaded", timeout=45000)
+        page.wait_for_timeout(2000)
     except Exception:
-        try:
-            page.goto(landing_url, wait_until="domcontentloaded", timeout=60000)
-            page.wait_for_timeout(1500)
-        except Exception:
-            return None
+        return None
     try:
         anchors = page.eval_on_selector_all(
             "a[href]",
@@ -346,21 +330,36 @@ def main():
             record(ok, dest, detail if ok else f"{detail} (tried {len(tried)} url(s))")
             time.sleep(1)
 
-        # --- Group 2: MDPI open-access review papers ---
+        # --- Group 2: Cal-Earth SuperAdobe ICC-ES report (run first: high value) ---
+        print("\n=== Cal-Earth / SuperAdobe ICC-ES report ===")
+        for landing, fname, must, candidates in CALEARTH_PAGES:
+            dest = CORPORA / CALEARTH_DIR / fname
+            if is_valid(dest, pdf=True):
+                record(True, dest, f"skip (already on disk, {dest.stat().st_size // 1024} KB)")
+                continue
+            pdf_url = scrape_pdf_link(page, landing, must_match=must)
+            tried, ok, detail = [], False, "no pdf link found"
+            if pdf_url:
+                tried.append(pdf_url)
+                ok, detail = fetch(page, pdf_url, dest, pdf=True)
+            if not ok:
+                for cand in candidates:
+                    if cand in tried:
+                        continue
+                    tried.append(cand)
+                    ok, detail = fetch(page, cand, dest, pdf=True)
+                    if ok:
+                        break
+            record(ok, dest, detail if ok else f"{detail} (tried {len(tried)} url(s))")
+            time.sleep(1)
+
+        # --- Group 3: MDPI open-access review papers ---
         print("\n=== MDPI open-access earthen reviews ===")
         for article_url, fname in MDPI_TARGETS:
             dest = CORPORA / MDPI_DIR / fname
             pdf_url = article_url.rstrip("/") + "/pdf"
             ok, detail = fetch(page, pdf_url, dest, pdf=True)
             record(ok, dest, f"{detail}  <- {article_url}")
-            time.sleep(1)
-
-        # --- Group 3: Cal-Earth structural test reports ---
-        print("\n=== Cal-Earth / SuperAdobe test reports ===")
-        for url, fname in CALEARTH_TARGETS:
-            dest = CORPORA / CALEARTH_DIR / fname
-            ok, detail = fetch(page, url, dest, pdf=True)
-            record(ok, dest, detail)
             time.sleep(1)
 
         browser.close()

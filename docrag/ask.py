@@ -39,6 +39,11 @@ def main(argv=None) -> int:
                     help="disable jurisdiction-balanced retrieval")
     ap.add_argument("--sources", action="store_true",
                     help="print retrieved chunks only (no LLM)")
+    ap.add_argument("--agentic", action="store_true",
+                    help="use the hypothesize-verify pipeline (reason.py)")
+    ap.add_argument("--plain", dest="agentic", action="store_false",
+                    help="force the single-pass answer path")
+    ap.set_defaults(agentic=None)
     args = ap.parse_args(argv)
 
     corpus = args.corpus.strip().lower()
@@ -53,8 +58,14 @@ def main(argv=None) -> int:
         _print_sources(r["results"])
         return 0
 
-    res = rag_answer(corpus=corpus, query=query, top_k=args.top_k,
-                     balance=balance)
+    # Default: agentic for the balanced building-codes corpus; plain otherwise.
+    use_agentic = args.agentic if args.agentic is not None else balance
+    if use_agentic:
+        from .reason import answer as rag_answer_fn
+    else:
+        rag_answer_fn = rag_answer
+    res = rag_answer_fn(corpus=corpus, query=query, top_k=args.top_k,
+                        balance=balance)
     if res.get("refused"):
         print("No grounded answer (%s)." % res.get("refusal_reason"))
         if res.get("chunks"):
@@ -62,13 +73,11 @@ def main(argv=None) -> int:
         return 0
 
     print(res["answer"])
-    cited = {n: res["chunks"][n - 1] for n in res.get("citations", [])
-             if 1 <= n <= len(res["chunks"])}
-    if cited:
-        print("\nCited:")
-        for n, c in sorted(cited.items()):
-            loc = ("p.%s" % c["page"]) if c.get("page") else ""
-            print("  [%d] %s %s" % (n, c.get("source_file") or "?", loc))
+    authorities = res.get("authorities") or []
+    if authorities:
+        print("\nAuthorities cited:")
+        for a in authorities:
+            print("  [%d] %s" % (a["n"], a["designation"]))
     return 0
 
 

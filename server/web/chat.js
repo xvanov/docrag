@@ -34,6 +34,8 @@
     corpus: "",
     history: [],
     inflight: false,
+    jobs: {},            // threadId -> in-flight job {abort, startedAt, done, statusText, sources, stageAt}
+    tickTimer: null,     // shared 1s status ticker
     sourceMap: {},       // assistantMsgId -> array of source-card elements (1-indexed)
     corpora: [],
     sources: [],         // documents in the active corpus (read-only display)
@@ -70,6 +72,7 @@
     sidebar: document.getElementById("history-sidebar"),
     sidebarToggle: document.getElementById("sidebar-toggle"),
     sidebarToggleFloating: document.getElementById("sidebar-toggle-floating"),
+    sidebarBackdrop: document.getElementById("sidebar-backdrop"),
     threadList: document.getElementById("thread-list"),
     newChatBtn: document.getElementById("new-chat"),
     // Corpus picker
@@ -140,9 +143,139 @@
   }
 
   function setStatus(text, withSpinner) {
-    if (withSpinner)
-      els.status.innerHTML = '<span class="spinner"></span>' + escapeHtml(text);
-    else els.status.textContent = text || "";
+    if (!text) { els.status.textContent = ""; els.status._txt = null; return; }
+    // Build the spinner + text nodes ONCE and only update the text afterwards,
+    // so the spinner element isn't recreated each tick (which restarted its
+    // CSS animation and made it stutter). The spinner now spins continuously.
+    if (!els.status._txt) {
+      els.status.innerHTML = '<span class="spinner"></span><span class="status-text"></span>';
+      els.status._spin = els.status.firstChild;
+      els.status._txt = els.status.lastChild;
+    }
+    els.status._spin.style.display = withSpinner ? "" : "none";
+    els.status._txt.textContent = text;
+  }
+
+  // Live status: a stage message with an always-ticking elapsed clock so the
+  // wait never looks frozen, plus (when a stage names sources) a rotating
+  // "Consulting <source>" line that reflects the real work in flight.
+  function fmtElapsed(ms) {
+    var s = Math.max(0, Math.floor(ms / 1000));
+    return Math.floor(s / 60) + ":" + ("0" + (s % 60)).slice(-2);
+  }
+  // Human-friendly total for the finished answer ("0.8 s", "12.3 s", "1 min 4 s").
+  function fmtDuration(ms) {
+    if (!ms) return "";
+    if (ms < 1000) return ms + " ms";
+    var s = ms / 1000;
+    if (s < 60) return s.toFixed(1) + " s";
+    var m = Math.floor(s / 60), r = Math.round(s % 60);
+    return m + " min " + (r ? r + " s" : "");
+  }
+  // ---- Per-chat jobs: each thread may have at most one in-flight query, but
+  // several threads can run at once. The composer status reflects ONLY the
+  // active thread's job, so switching chats never shows a stale spinner. ----
+  function activeJob() { return state.jobs[state.activeThreadId] || null; }
+  function anyRunningJob() {
+    for (var k in state.jobs)
+      if (state.jobs[k] && !state.jobs[k].done) return true;
+    return false;
+  }
+  function renderActiveStatus() {
+    var job = activeJob();
+    if (!job || job.done) { setStatus(""); return; }
+    var base = job.statusText || "Thinking";
+    if (job.sources && job.sources.length) {
+      var k = Math.floor((Date.now() - (job.stageAt || job.startedAt)) / 1800) % job.sources.length;
+      base = "Consulting " + truncate(job.sources[k], 44);
+    }
+    setStatus(base + "  ·  " + fmtElapsed(Date.now() - job.startedAt), true);
+  }
+  // One shared 1s ticker drives the elapsed clock + source rotation; it stops
+  // itself once no job anywhere is still running.
+  function ensureTicker() {
+    if (state.tickTimer) return;
+    state.tickTimer = setInterval(function () {
+      renderActiveStatus();
+      if (!anyRunningJob()) { clearInterval(state.tickTimer); state.tickTimer = null; }
+    }, 1000);
+  }
+
+  var SEND_SVG = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 19V5m0 0l-6 6m6-6l6 6"/></svg>';
+  var STOP_SVG = '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>';
+  function updateSendButton() {
+    var running = !!(activeJob() && !activeJob().done);
+    els.send.classList.toggle("stop", running);
+    els.send.innerHTML = running ? STOP_SVG : SEND_SVG;
+    els.send.title = running ? "Stop generating" : "Send (Enter)";
+    els.send.setAttribute("aria-label", running ? "Stop generating" : "Send");
+  }
+  function abortActiveJob() {
+    var job = activeJob();
+    if (job && !job.done) { try { job.abort.abort(); } catch (e) {} }
+  }
+  function onSendClick() {
+    if (activeJob() && !activeJob().done) abortActiveJob();
+    else send();
+  }
+
+  // ---- Sidebar completion signal (flash + bell until the chat is opened) ----
+  function markAttention(tid) {
+    var t = findThread(tid);
+    if (t) { t.attention = true; renderSidebar(); }
+  }
+  function clearAttention(tid) {
+    var t = findThread(tid);
+    if (t && t.attention) { t.attention = false; }
+  }
+  function removeTrailingUser(tid) {
+    var t = findThread(tid);
+    if (!t || !t.history.length) return;
+    if (t.history[t.history.length - 1].role === "user") {
+      t.history.pop(); saveThreadsToStore();
+    }
+  }
+
+  // ---- Clipboard ----
+  function copyText(txt) {
+    if (navigator.clipboard && navigator.clipboard.writeText)
+      return navigator.clipboard.writeText(txt);
+    return new Promise(function (res, rej) {
+      try {
+        var ta = document.createElement("textarea");
+        ta.value = txt; ta.style.position = "fixed"; ta.style.opacity = "0";
+        document.body.appendChild(ta); ta.focus(); ta.select();
+        document.execCommand("copy"); document.body.removeChild(ta); res();
+      } catch (e) { rej(e); }
+    });
+  }
+  var COPY_SVG = '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a2 2 0 012-2h8"/></svg>';
+  var CHECK_SVG = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 13l4 4L19 7"/></svg>';
+  function makeCopyBtn(getText, label) {
+    var b = el("button", { className: "copy-btn",
+      attrs: { type: "button", title: label || "Copy" }, html: COPY_SVG });
+    b.addEventListener("click", function (ev) {
+      ev.stopPropagation();
+      copyText(getText() || "").then(function () {
+        b.classList.add("copied"); b.innerHTML = CHECK_SVG;
+        setTimeout(function () { b.classList.remove("copied"); b.innerHTML = COPY_SVG; }, 1200);
+      }).catch(function () {});
+    });
+    return b;
+  }
+
+  // Minimal SSE-frame parser: "event:" + (possibly multi-line) "data:".
+  function parseSSE(block) {
+    var event = "message", data = "";
+    var lines = block.split("\n");
+    for (var i = 0; i < lines.length; i++) {
+      var ln = lines[i];
+      if (ln.indexOf("event:") === 0) event = ln.slice(6).trim();
+      else if (ln.indexOf("data:") === 0) data += ln.slice(5).trim();
+    }
+    if (!data) return null;
+    try { return { event: event, data: JSON.parse(data) }; }
+    catch (e) { return { event: event, data: null }; }
   }
 
   function truncate(s, n) {
@@ -231,23 +364,9 @@
     renderSidebar();
   }
 
-  function pushAssistantToThread(envelope) {
-    if (!state.activeThreadId) return;
-    var thread = findThread(state.activeThreadId);
-    if (!thread) return;
-    thread.history.push({
-      role: "assistant", content: envelope.answer || "",
-      citations: (envelope.citations || []).slice(),
-      chunks: safeChunks(envelope.chunks),
-      refused: !!envelope.refused, refusal_reason: envelope.refusal_reason || "",
-      status: envelope.status || "", sources_only: !!envelope.sources_only,
-      tokens: envelope.tokens || null, elapsed_ms: envelope.elapsed_ms || 0,
-    });
-    thread.ts_last = Date.now();
-    trimThreadHistory(thread);
-    saveThreadsToStore();
-    renderSidebar();
-  }
+  // (assistant turns are saved per-thread-id via pushAssistantToThreadById,
+  // so a background chat's answer lands in the right thread even when you've
+  // switched away.)
 
   // ---------- Sidebar ----------
 
@@ -262,12 +381,23 @@
       els.threadList.appendChild(buildThreadRow(state.threads[i]));
   }
 
+  var BELL_SVG = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18 8a6 6 0 10-12 0c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.7 21a2 2 0 01-3.4 0"/></svg>';
+
   function buildThreadRow(thread) {
-    var head = el("div", { className: "row-head" }, [
+    var running = !!(state.jobs[thread.id] && !state.jobs[thread.id].done);
+    var headKids = [
       el("span", { className: "row-corpus", text: thread.corpus || "?" }),
       el("span", { html: "&middot;" }),
       el("span", { className: "row-time", text: relativeTime(thread.ts_last) }),
-    ]);
+    ];
+    if (running)
+      headKids.push(el("span", { className: "row-status",
+        html: '<span class="mini-spinner"></span>',
+        attrs: { title: "Working..." } }));
+    else if (thread.attention)
+      headKids.push(el("span", { className: "row-status bell", html: BELL_SVG,
+        attrs: { title: "Answer ready" } }));
+    var head = el("div", { className: "row-head" }, headKids);
     var title = el("div", { className: "row-title", text: thread.title || "(empty)" });
     var body = el("div", { className: "row-body" }, [head, title]);
     var del = el("button", {
@@ -278,10 +408,11 @@
       ev.stopPropagation();
       if (window.confirm("Delete this chat thread?")) deleteThread(thread.id);
     });
-    var row = el("li", {
-      className: "thread-row" + (thread.id === state.activeThreadId ? " active" : ""),
-      attrs: { "data-id": thread.id },
-    }, [body, del]);
+    var cls = "thread-row"
+      + (thread.id === state.activeThreadId ? " active" : "")
+      + (running ? " running" : "")
+      + (thread.attention ? " attention" : "");
+    var row = el("li", { className: cls, attrs: { "data-id": thread.id } }, [body, del]);
     row.addEventListener("click", function () { loadThread(thread.id); });
     return row;
   }
@@ -304,15 +435,7 @@
     state.sourceMap = {};
   }
 
-  function loadThread(id) {
-    var thread = findThread(id);
-    if (!thread) return;
-    state.activeThreadId = id;
-    state.history = [];
-    clearThreadDiv();
-    showConversation();
-    if (thread.corpus && thread.corpus !== state.corpus)
-      setActiveCorpus(thread.corpus, false);
+  function renderThreadHistory(thread) {
     for (var i = 0; i < thread.history.length; i++) {
       var entry = thread.history[i];
       if (entry.role === "user") {
@@ -320,6 +443,7 @@
       } else if (entry.role === "assistant") {
         var envelope = {
           answer: entry.content || "", citations: entry.citations || [],
+          authorities: entry.authorities || [],
           chunks: entry.chunks || [], refused: !!entry.refused,
           refusal_reason: entry.refusal_reason || "", status: entry.status || "",
           sources_only: !!entry.sources_only, tokens: entry.tokens || {},
@@ -329,14 +453,52 @@
         for (var j = i - 1; j >= 0; j--)
           if (thread.history[j].role === "user") { query = thread.history[j].content || ""; break; }
         renderAssistantMessage(envelope, query);
-        if (entry.content) {
-          state.history.push({ role: "user", content: query });
-          state.history.push({ role: "assistant", content: entry.content });
-        }
       }
     }
-    if (state.history.length > HISTORY_CAP) state.history = state.history.slice(-HISTORY_CAP);
+  }
+
+  // Re-draw the active thread from the store (used after switching, aborting,
+  // or a background answer landing in the thread you're viewing).
+  function renderActiveThread() {
+    var t = findThread(state.activeThreadId);
+    clearThreadDiv();
+    if (!t || !t.history.length) { showWelcome(); return; }
+    showConversation();
+    renderThreadHistory(t);
+  }
+
+  function loadThread(id) {
+    var thread = findThread(id);
+    if (!thread) return;
+    state.activeThreadId = id;
+    clearAttention(id);
+    if (thread.corpus && thread.corpus !== state.corpus)
+      setActiveCorpus(thread.corpus, false);
+    renderActiveThread();
     renderSidebar();
+    // Reflect THIS thread's job (if any) in the composer -- fixes the stale
+    // spinner that used to show when opening a different chat.
+    updateSendButton();
+    renderActiveStatus();
+    if (activeJob() && !activeJob().done) ensureTicker();
+    closeSidebarIfMobile();
+  }
+
+  function pushAssistantToThreadById(tid, envelope) {
+    var thread = findThread(tid);
+    if (!thread) return;
+    thread.history.push({
+      role: "assistant", content: envelope.answer || "",
+      citations: (envelope.citations || []).slice(),
+      authorities: (envelope.authorities || []).slice(),
+      chunks: safeChunks(envelope.chunks),
+      refused: !!envelope.refused, refusal_reason: envelope.refusal_reason || "",
+      status: envelope.status || "", sources_only: !!envelope.sources_only,
+      tokens: envelope.tokens || null, elapsed_ms: envelope.elapsed_ms || 0,
+    });
+    thread.ts_last = Date.now();
+    trimThreadHistory(thread);
+    saveThreadsToStore();
   }
 
   // ---------- Sources popover (read-only; NOT a corpus switcher) ----------
@@ -349,6 +511,20 @@
     return slug.replace(/[-_]/g, " ").replace(/\b\w/g, function (c) { return c.toUpperCase(); });
   }
 
+  // Tiers the user has muted (included by default). Persisted across sessions.
+  state.excludedTiers = loadLocalJson("docrag.excludedTiers", {});
+
+  var TIER_ORDER = ["STATE", "LOCAL", "LOCAL-GUIDANCE", "MODEL", "FEDERAL", "OTHER"];
+
+  function excludedSourceGlobs() {
+    // Map muted tiers -> the member source paths to omit at retrieval time.
+    var globs = [];
+    state.sources.forEach(function (s) {
+      if (state.excludedTiers[s.tier || "OTHER"] && s.path) globs.push(s.path);
+    });
+    return globs;
+  }
+
   function renderSourcesList() {
     if (!els.sourcesList) return;
     els.sourcesList.innerHTML = "";
@@ -356,12 +532,33 @@
       els.sourcesList.appendChild(el("li", { className: "sources-menu-empty", text: "(no documents indexed)" }));
       return;
     }
+    // Group sources by authority tier; each group gets an include/omit checkbox.
+    var groups = {};
     state.sources.forEach(function (s) {
-      els.sourcesList.appendChild(el("li", { className: "sources-menu-item" }, [
-        el("span", { className: "src-file", text: s.file || "unknown" }),
-        s.jurisdiction ? el("span", { className: "src-juris", text: s.jurisdiction }) : null,
-        el("span", { className: "src-count", text: (s.chunks || 0).toLocaleString() }),
-      ]));
+      var t = s.tier || "OTHER";
+      (groups[t] = groups[t] || { label: s.tier_label || t, items: [] }).items.push(s);
+    });
+    TIER_ORDER.concat(Object.keys(groups)).forEach(function (t) {
+      if (!groups[t] || groups[t]._done) return;
+      groups[t]._done = true;
+      var g = groups[t], on = !state.excludedTiers[t];
+      var cb = el("input", { attrs: { type: "checkbox" } });
+      cb.checked = on;
+      cb.addEventListener("change", function () {
+        if (cb.checked) delete state.excludedTiers[t]; else state.excludedTiers[t] = true;
+        saveLocal("docrag.excludedTiers", state.excludedTiers);
+        renderSourcesList();
+      });
+      var head = el("li", { className: "sources-group-head" + (on ? "" : " muted") }, [
+        el("label", {}, [cb, el("span", { text: " " + g.label + " (" + g.items.length + ")" })]),
+      ]);
+      els.sourcesList.appendChild(head);
+      g.items.forEach(function (s) {
+        els.sourcesList.appendChild(el("li", { className: "sources-menu-item" + (on ? "" : " muted") }, [
+          el("span", { className: "src-file", text: s.file || "unknown" }),
+          el("span", { className: "src-count", text: (s.chunks || 0).toLocaleString() }),
+        ]));
+      });
     });
   }
 
@@ -569,8 +766,10 @@
   // ---------- Render ----------
 
   function renderUserMessage(text) {
-    els.thread.appendChild(el("div", { className: "msg user" },
-      [el("div", { className: "bubble", text: text })]));
+    var bubble = el("div", { className: "bubble" });
+    bubble.appendChild(document.createTextNode(text));
+    bubble.appendChild(makeCopyBtn(function () { return text; }, "Copy question"));
+    els.thread.appendChild(el("div", { className: "msg user" }, [bubble]));
     scrollToBottom();
   }
 
@@ -710,7 +909,7 @@
     src = src.replace(/```([a-z0-9_-]*)\r?\n([\s\S]*?)```/gi, function (_m, _l, body) {
       fences.push(body); return "\n\x00FENCE" + (fences.length - 1) + "\x00\n";
     });
-    var lines = src.split(/\r?\n/), out = [], listType = null, inQuote = false;
+    var lines = src.split(/\r?\n/), out = [], listType = null, inQuote = false, olNext = 1;
     function closeList() { if (listType) { out.push("</" + listType + ">"); listType = null; } }
     function closeQuote() { if (inQuote) { out.push("</blockquote>"); inQuote = false; } }
     function closeBlocks() { closeList(); closeQuote(); }
@@ -720,7 +919,7 @@
       if (fm) { closeBlocks(); out.push("<pre><code>" + escapeHtml(fences[parseInt(fm[1], 10)]) + "</code></pre>"); continue; }
       if (!trimmed) { closeBlocks(); continue; }
       var hm = trimmed.match(/^(#{1,6})\s+(.*)$/);
-      if (hm) { closeBlocks(); var lvl = Math.min(hm[1].length + 1, 6); out.push("<h" + lvl + ">" + inlineMd(hm[2]) + "</h" + lvl + ">"); continue; }
+      if (hm) { closeBlocks(); olNext = 1; var lvl = Math.min(hm[1].length + 1, 6); out.push("<h" + lvl + ">" + inlineMd(hm[2]) + "</h" + lvl + ">"); continue; }
       if (trimmed.indexOf("> ") === 0 || trimmed === ">") {
         closeList(); if (!inQuote) { out.push("<blockquote>"); inQuote = true; }
         out.push("<p>" + inlineMd(trimmed.replace(/^>\s?/, "")) + "</p>"); continue;
@@ -728,7 +927,7 @@
       var ulm = trimmed.match(/^[-*]\s+(.*)$/);
       if (ulm) { closeQuote(); if (listType !== "ul") { closeList(); out.push("<ul>"); listType = "ul"; } out.push("<li>" + inlineMd(ulm[1]) + "</li>"); continue; }
       var olm = trimmed.match(/^\d+\.\s+(.*)$/);
-      if (olm) { closeQuote(); if (listType !== "ol") { closeList(); out.push("<ol>"); listType = "ol"; } out.push("<li>" + inlineMd(olm[1]) + "</li>"); continue; }
+      if (olm) { closeQuote(); if (listType !== "ol") { closeList(); out.push("<ol>"); listType = "ol"; } out.push('<li value="' + olNext + '">' + inlineMd(olm[1]) + "</li>"); olNext++; continue; }
       if (listType && /^\s+/.test(line) && out.length) {
         var prev = out[out.length - 1];
         if (prev.indexOf("<li>") === 0) { out[out.length - 1] = prev.replace(/<\/li>$/, " " + inlineMd(trimmed) + "</li>"); continue; }
@@ -762,16 +961,39 @@
     var chunks = envelope.chunks || [];
     var msg = el("div", { className: "msg assistant", attrs: { "data-id": msgId } });
 
+    var contentBox = null;
     if (envelope.refused) {
-      msg.appendChild(el("div", {
+      contentBox = el("div", {
         className: "refusal " + (envelope.status === "no_results" ? "no_results" : ""),
         text: "REFUSED: " + (envelope.refusal_reason || envelope.status || "refused"),
-      }));
+      });
     } else if (envelope.answer) {
-      msg.appendChild(el("div", { className: "bubble",
-        html: renderAnswerWithMarkdown(envelope.answer, msgId, chunks) }));
+      contentBox = el("div", { className: "bubble",
+        html: renderAnswerWithMarkdown(envelope.answer, msgId, chunks) });
     } else if (envelope.sources_only) {
-      msg.appendChild(el("div", { className: "bubble", text: "Sources only (no LLM call)." }));
+      contentBox = el("div", { className: "bubble", text: "Sources only (no LLM call)." });
+    }
+    if (contentBox) {
+      var copyable = envelope.answer || envelope.refusal_reason || "";
+      if (copyable)
+        contentBox.appendChild(makeCopyBtn(function () { return copyable; }, "Copy answer"));
+      msg.appendChild(contentBox);
+    }
+
+    var authorities = envelope.authorities || [];
+    if (!envelope.refused && authorities.length) {
+      var authItems = authorities.map(function (a) {
+        return el("li", { className: "authority" }, [
+          el("span", { className: "cite", attrs: { "data-msg": msgId, "data-n": String(a.n) },
+            text: "[" + a.n + "]" }),
+          el("span", { text: " " + (a.designation || "") }),
+        ]);
+      });
+      var authBox = el("div", { className: "authorities" }, [
+        el("div", { className: "authorities-title", text: "Authorities cited" }),
+        el("ul", { className: "authorities-list" }, authItems),
+      ]);
+      msg.appendChild(authBox);
     }
 
     if (chunks.length) {
@@ -791,12 +1013,19 @@
       msg.appendChild(details);
     }
 
+    // Friendly total generation time, shown under the finished answer.
+    if (envelope.elapsed_ms && !envelope.sources_only) {
+      msg.appendChild(el("div", { className: "answer-time", html:
+        '<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="13" r="8"/>'
+        + '<path d="M12 9v4l2.5 2"/><path d="M9 2h6"/></svg>'
+        + '<span>Generated in ' + escapeHtml(fmtDuration(envelope.elapsed_ms)) + '</span>' }));
+    }
+
     var t = envelope.tokens || {};
-    if (t.prompt || t.completion || envelope.elapsed_ms) {
+    if (t.prompt || t.completion) {
       var bits = [];
       if (t.prompt) bits.push("prompt=" + t.prompt);
       if (t.completion) bits.push("completion=" + t.completion);
-      if (envelope.elapsed_ms) bits.push(envelope.elapsed_ms + "ms");
       if (envelope.citations && envelope.citations.length) bits.push("cites=" + envelope.citations.join(","));
       msg.appendChild(el("div", { className: "meta", text: bits.join(" | ") }));
     }
@@ -831,84 +1060,169 @@
 
   // ---------- Send ----------
 
-  async function send() {
-    if (state.inflight) return;
+  function send() {
     var query = els.input.value.trim();
     if (!query) return;
     var corpus = els.corpus.value;
     if (!corpus) { showConversation(); renderErrorMessage("no corpus selected"); return; }
+
+    var thread = ensureActiveThread(corpus);
+    var tid = thread.id;
+    if (state.jobs[tid] && !state.jobs[tid].done) return;  // one query per chat
+
     var sourcesOnly = els.sourcesOnly.checked;
     var topK = parseInt(els.topk.value, 10) || 12;
 
-    showConversation();
-    if (!state.activeThreadId) clearThreadDiv();
+    // History for the server = this thread's prior turns (before the new one).
+    var hist = [];
+    for (var i = 0; i < thread.history.length; i++) {
+      var e = thread.history[i];
+      if ((e.role === "user" || e.role === "assistant") && e.content)
+        hist.push({ role: e.role, content: e.content });
+    }
+    hist = hist.slice(-HISTORY_CAP);
 
-    renderUserMessage(query);
+    pushUserToThread(query);          // append + persist + refresh sidebar
     els.input.value = "";
     autoGrowInput();
-    pushUserToThread(query);
+    showConversation();
+    if (tid === state.activeThreadId) renderUserMessage(query);
 
-    var historyForServer = state.history.slice(-HISTORY_CAP);
-    state.inflight = true;
-    els.send.disabled = true;
-    setStatus("thinking", true);
+    var job = { threadId: tid, abort: new AbortController(),
+                startedAt: Date.now(), done: false,
+                statusText: "Thinking", sources: null, stageAt: Date.now() };
+    state.jobs[tid] = job;
+    updateSendButton();
+    ensureTicker();
+    renderActiveStatus();
 
+    runJob(job, {
+      corpus: corpus, query: query, history: hist,
+      sources_only: sourcesOnly, top_k: topK, thread_id: tid,
+    });
+  }
+
+  async function runJob(job, payload) {
+    var tid = job.threadId;
     try {
       var r = await fetch("/api/chat", {
         method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ corpus: corpus, query: query,
-          history: historyForServer, sources_only: sourcesOnly, top_k: topK,
-          location: state.location || undefined, versions: state.versions || {} }),
+        signal: job.abort.signal,
+        body: JSON.stringify({
+          corpus: payload.corpus, query: payload.query, history: payload.history,
+          sources_only: payload.sources_only, top_k: payload.top_k, stream: true,
+          thread_id: payload.thread_id,
+          location: state.location || undefined, versions: state.versions || {},
+          exclude_sources: excludedSourceGlobs() }),
       });
+      var ctype = r.headers.get("Content-Type") || "";
       var data;
-      try { data = await r.json(); }
-      catch (e) { throw new Error("bad JSON from server (HTTP " + r.status + ")"); }
-      if (!r.ok) throw new Error(data.error || "HTTP " + r.status);
-      renderAssistantMessage(data, query);
-      pushAssistantToThread(data);
-      if (data.answer) {
-        state.history.push({ role: "user", content: query });
-        state.history.push({ role: "assistant", content: data.answer });
-        if (state.history.length > HISTORY_CAP) state.history = state.history.slice(-HISTORY_CAP);
+      if (ctype.indexOf("text/event-stream") >= 0 && r.body && r.body.getReader) {
+        var reader = r.body.getReader();
+        var dec = new TextDecoder();
+        var buf = "", finalEnv = null, errMsg = null;
+        while (true) {
+          var chunk = await reader.read();
+          if (chunk.done) break;
+          buf += dec.decode(chunk.value, { stream: true });
+          var idx;
+          while ((idx = buf.indexOf("\n\n")) >= 0) {
+            var frame = buf.slice(0, idx); buf = buf.slice(idx + 2);
+            var ev = parseSSE(frame);
+            if (!ev) continue;
+            if (ev.event === "progress") {
+              var p = ev.data || {};
+              job.statusText = p.message || "Thinking";
+              if (p.sources && p.sources.length) { job.sources = p.sources; job.stageAt = Date.now(); }
+              else job.sources = null;
+              if (tid === state.activeThreadId) renderActiveStatus();
+            } else if (ev.event === "done") finalEnv = ev.data;
+            else if (ev.event === "error") errMsg = (ev.data && ev.data.error) || "error";
+          }
+        }
+        if (errMsg) throw new Error(errMsg);
+        if (!finalEnv) throw new Error("stream ended without an answer");
+        data = finalEnv;
+      } else {
+        try { data = await r.json(); }
+        catch (e) { throw new Error("bad JSON from server (HTTP " + r.status + ")"); }
+        if (!r.ok) throw new Error(data.error || "HTTP " + r.status);
       }
+      job.done = true;
+      pushAssistantToThreadById(tid, data);
+      if (tid === state.activeThreadId) renderAssistantMessage(data, payload.query);
+      else markAttention(tid);          // flash + bell on the background chat
     } catch (e) {
-      console.error(e);
-      renderErrorMessage(e.message || String(e));
+      job.done = true;
+      if (e && e.name === "AbortError") {
+        removeTrailingUser(tid);          // drop the cancelled question
+        if (tid === state.activeThreadId) renderActiveThread();
+      } else {
+        console.error(e);
+        if (tid === state.activeThreadId) renderErrorMessage(e.message || String(e));
+        else markAttention(tid);
+      }
     } finally {
-      state.inflight = false;
-      els.send.disabled = false;
-      setStatus("");
-      els.input.focus();
+      delete state.jobs[tid];
+      renderSidebar();
+      if (tid === state.activeThreadId) {
+        updateSendButton();
+        renderActiveStatus();
+        els.input.focus();
+      }
     }
   }
 
   // ---------- Sidebar collapse + new chat ----------
 
-  function applySidebarState() {
-    var collapsed = false;
-    try { collapsed = window.localStorage.getItem(SIDEBAR_KEY) === "1"; } catch (e) {}
+  function isMobile() {
+    return window.matchMedia("(max-width: 860px)").matches;
+  }
+  function setSidebarCollapsed(collapsed) {
     els.sidebar.classList.toggle("collapsed", collapsed);
     document.body.classList.toggle("sidebar-collapsed", collapsed);
+  }
+  function applySidebarState() {
+    // On phones the sidebar is an off-canvas overlay -- always start closed,
+    // regardless of the desktop preference, so it never covers the chat.
+    if (isMobile()) { setSidebarCollapsed(true); return; }
+    var collapsed = false;
+    try { collapsed = window.localStorage.getItem(SIDEBAR_KEY) === "1"; } catch (e) {}
+    setSidebarCollapsed(collapsed);
   }
   function toggleSidebar() {
     var collapsed = els.sidebar.classList.toggle("collapsed");
     document.body.classList.toggle("sidebar-collapsed", collapsed);
-    try { window.localStorage.setItem(SIDEBAR_KEY, collapsed ? "1" : "0"); } catch (e) {}
+    // Only persist the preference on desktop; mobile always reopens closed.
+    if (!isMobile()) {
+      try { window.localStorage.setItem(SIDEBAR_KEY, collapsed ? "1" : "0"); } catch (e) {}
+    }
+  }
+  // After navigating on mobile, slide the overlay sidebar back out of the way.
+  function closeSidebarIfMobile() {
+    if (isMobile() && !els.sidebar.classList.contains("collapsed")) setSidebarCollapsed(true);
   }
   function newChat() {
-    state.activeThreadId = null;
+    state.activeThreadId = null;     // no job -> composer is idle
     state.history = [];
     clearThreadDiv();
     showWelcome();
     renderSidebar();
+    updateSendButton();
+    renderActiveStatus();
+    closeSidebarIfMobile();
     els.input.focus();
   }
 
   // ---------- Wire up ----------
 
-  els.send.addEventListener("click", send);
+  els.send.addEventListener("click", onSendClick);
   els.input.addEventListener("keydown", function (ev) {
-    if (ev.key === "Enter" && !ev.shiftKey) { ev.preventDefault(); send(); }
+    if (ev.key === "Enter" && !ev.shiftKey) {
+      ev.preventDefault();
+      if (activeJob() && !activeJob().done) return;  // a query is already running in this chat
+      send();
+    }
   });
   els.input.addEventListener("input", autoGrowInput);
 
@@ -927,7 +1241,11 @@
 
   els.sidebarToggle.addEventListener("click", toggleSidebar);
   if (els.sidebarToggleFloating) els.sidebarToggleFloating.addEventListener("click", toggleSidebar);
+  if (els.sidebarBackdrop) els.sidebarBackdrop.addEventListener("click", closeSidebarIfMobile);
   els.newChatBtn.addEventListener("click", newChat);
+  // If the viewport crosses the mobile breakpoint, re-apply the correct state
+  // (e.g. rotating a tablet, or resizing a desktop window down).
+  window.addEventListener("resize", applySidebarState);
 
   // ---------- Settings popover ----------
 

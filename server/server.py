@@ -41,8 +41,10 @@ import os
 import re
 import signal
 import socket
+import queue
 import subprocess
 import sys
+import threading
 import time
 import traceback
 import urllib.parse
@@ -50,7 +52,14 @@ import urllib.parse
 from docrag import settings
 from docrag import facets
 from docrag.answer import answer as rag_answer_call
+from docrag.reason import answer as agentic_answer_call
+from docrag import settings as _settings
 from docrag.query import rag_query
+
+
+def _agentic_enabled() -> bool:
+    val = (_settings.get("DOCRAG_AGENTIC", "1") or "1").strip().lower()
+    return val not in ("0", "false", "no", "off")
 from docrag.db import open_db, valid_corpus
 
 
@@ -156,14 +165,24 @@ def _corpus_sources(corpus: str) -> list:
         ).fetchall()
     finally:
         conn.close()
+    from docrag.answer import _authority_tier
+    _TIER_LABEL = {
+        "STATE": "NC state law & code", "LOCAL": "Durham ordinance (UDO)",
+        "LOCAL-GUIDANCE": "Durham agency guidance (durhamnc.gov)",
+        "MODEL": "Model codes (IBC/IRC...)", "FEDERAL": "Federal (ADA/FEMA)",
+        "OTHER": "Other",
+    }
     out = []
     for source_file, path, n in rows:
         folder = (path or "").split("/")[0] if "/" in (path or "") else ""
         label = _JURISDICTION_LABELS.get(folder, folder.replace("-", " ").title())
+        tier = _authority_tier({"path": path})
         out.append({
             "file": source_file,
             "path": path,
             "jurisdiction": label,
+            "tier": tier,
+            "tier_label": _TIER_LABEL.get(tier, tier),
             "chunks": int(n),
         })
     return out
@@ -192,6 +211,44 @@ def _write_feedback_line(payload: dict) -> str:
     with open(path, "a", encoding="utf-8") as f:
         f.write(json.dumps(entry, ensure_ascii=True) + "\n")
     return path
+
+
+def _trace_path(corpus: str) -> str:
+    base = os.path.join(settings.index_dir(), "traces")
+    os.makedirs(base, exist_ok=True)
+    return os.path.join(base, "%s.jsonl" % _validate_corpus(corpus))
+
+
+def _write_trace_record(corpus, query, envelope, meta):
+    """Append one structured debug record (full chain: plan -> retrieval ->
+    each verify round's LLM output + timings -> final answer) per request, so
+    conversations can be reviewed/debugged later. Best-effort; never raises."""
+    try:
+        env = envelope or {}
+        rec = {
+            "ts": _now_iso_utc(),
+            "thread_id": meta.get("thread_id"),
+            "corpus": corpus,
+            "query": query,
+            "location": meta.get("location"),
+            "balance": meta.get("balance"),
+            "sources_only": bool(env.get("sources_only")),
+            "elapsed_ms": env.get("elapsed_ms"),
+            "refused": bool(env.get("refused")),
+            "refusal_reason": env.get("refusal_reason"),
+            "status": env.get("status"),
+            "error": meta.get("error"),
+            "tokens": env.get("tokens"),
+            "n_citations": len(env.get("citations") or []),
+            "n_chunks": len(env.get("chunks") or []),
+            "answer": env.get("answer"),
+            "plan": env.get("plan"),
+            "trace": env.get("trace"),
+        }
+        with open(_trace_path(corpus), "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=True) + "\n")
+    except Exception as e:  # noqa: BLE001
+        sys.stderr.write("[trace] write failed: %s\n" % e)
 
 
 # --- Source path resolution --------------------------------------------------
@@ -322,6 +379,9 @@ def _clear_pid_file() -> None:
 
 
 class DocRagHandler(http.server.BaseHTTPRequestHandler):
+    # Per-connection socket timeout so a client that navigates away mid-stream
+    # can't wedge a worker on a blocking write (was freezing the whole server).
+    timeout = 120
 
     def log_message(self, fmt, *args):  # noqa: A002
         pass
@@ -528,6 +588,26 @@ class DocRagHandler(http.server.BaseHTTPRequestHandler):
                 "versions": eff_versions,
             }
 
+        # Source include/omit (UI toggle): list of path prefixes/globs to mute.
+        exclude_sources = body.get("exclude_sources") or []
+        if isinstance(exclude_sources, list) and exclude_sources:
+            filters = filters or {}
+            filters["exclude_globs"] = [str(g) for g in exclude_sources]
+
+        # Streaming path: for the slow agentic pipeline, stream live stage
+        # updates (Server-Sent Events) so the UI shows what's happening instead
+        # of a bare spinner. Only when the client opts in and the agentic path
+        # is actually in play; everything else uses the plain JSON path below.
+        want_stream = (bool(body.get("stream"))
+                       and not sources_only
+                       and balance and _agentic_enabled())
+        if want_stream:
+            self._handle_chat_stream(
+                corpus=corpus, query=query, history=history, top_k=top_k,
+                filters=filters, balance=balance, location_key=location_key,
+                thread_id=body.get("thread_id"))
+            return
+
         t0 = time.monotonic()
         try:
             if sources_only:
@@ -542,10 +622,13 @@ class DocRagHandler(http.server.BaseHTTPRequestHandler):
                     "sources_only": True,
                 }
             else:
-                envelope = rag_answer_call(corpus=corpus, query=query,
-                                           history=history, top_k=top_k,
-                                           filters=filters, balance=balance,
-                                           location=location_key)
+                answer_fn = rag_answer_call
+                if balance and _agentic_enabled():
+                    answer_fn = agentic_answer_call  # hypothesize-verify pipeline
+                envelope = answer_fn(corpus=corpus, query=query,
+                                     history=history, top_k=top_k,
+                                     filters=filters, balance=balance,
+                                     location=location_key)
                 envelope["sources_only"] = False
         except FileNotFoundError as e:
             sys.stderr.write("[chat] DB missing: %s\n" % e)
@@ -565,7 +648,107 @@ class DocRagHandler(http.server.BaseHTTPRequestHandler):
         envelope["query"] = query
         envelope["balance"] = balance
         envelope["location"] = location_key
+        _write_trace_record(corpus, query, envelope, {
+            "thread_id": body.get("thread_id"), "location": location_key,
+            "balance": balance})
+        envelope.pop("trace", None)
+        envelope.pop("plan", None)
         self._send_json(envelope)
+
+    def _sse(self, event, data):
+        """Write one Server-Sent Event. Returns False if the socket is gone."""
+        try:
+            payload = "event: %s\ndata: %s\n\n" % (
+                event, json.dumps(data, ensure_ascii=True))
+            self.wfile.write(payload.encode("utf-8"))
+            self.wfile.flush()
+            return True
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            return False
+
+    def _handle_chat_stream(self, corpus, query, history, top_k,
+                            filters, balance, location_key, thread_id=None):
+        """Run the agentic answer in a worker thread, streaming live stage
+        events to the client as SSE, then a terminal 'done' (or 'error')."""
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        self.send_header("X-Accel-Buffering", "no")  # disable proxy buffering
+        self.end_headers()
+
+        events = queue.Queue()
+        result = {}
+
+        def on_progress(ev):
+            events.put(("progress", ev))
+
+        def run():
+            try:
+                env = agentic_answer_call(
+                    corpus=corpus, query=query, history=history, top_k=top_k,
+                    filters=filters, balance=balance, location=location_key,
+                    progress=on_progress)
+                env["sources_only"] = False
+                result["env"] = env
+            except FileNotFoundError as e:
+                result["error"] = ("not_found", "corpus index not found: %s" % corpus)
+                sys.stderr.write("[chat-stream] DB missing: %s\n" % e)
+            except EnvironmentError as e:
+                result["error"] = ("env", str(e))
+                sys.stderr.write("[chat-stream] env error: %s\n" % e)
+            except Exception as e:  # noqa: BLE001
+                result["error"] = ("error", str(e))
+                sys.stderr.write("[chat-stream] error: %s\n%s\n"
+                                 % (e, traceback.format_exc()))
+            finally:
+                events.put(("__end__", None))
+
+        t0 = time.monotonic()
+        worker = threading.Thread(target=run, daemon=True)
+        worker.start()
+
+        STREAM_MAX = 180  # hard ceiling (s) on one answer stream
+        alive = True
+        while True:
+            if time.monotonic() - t0 > STREAM_MAX:
+                self._sse("error", {"error": "answer timed out", "kind": "timeout"})
+                return
+            try:
+                kind, payload = events.get(timeout=10)
+            except queue.Empty:
+                # heartbeat keeps intermediaries from closing an idle stream;
+                # if the client is gone, stop pumping (worker is a daemon).
+                if not alive:
+                    return
+                alive = self._sse("ping", {"t": int(time.monotonic() - t0)})
+                continue
+            if kind == "__end__":
+                break
+            if alive:
+                alive = self._sse(kind, payload)
+                if not alive:
+                    return  # client disconnected -- free the handler
+
+        worker.join(timeout=1.0)
+        if "error" in result:
+            kind, msg = result["error"]
+            _write_trace_record(corpus, query, {}, {
+                "thread_id": thread_id, "location": location_key,
+                "balance": balance, "error": msg})
+            self._sse("error", {"error": msg, "kind": kind})
+            return
+        env = result.get("env") or {}
+        env["elapsed_ms"] = int((time.monotonic() - t0) * 1000)
+        env["corpus"] = corpus
+        env["query"] = query
+        env["balance"] = balance
+        env["location"] = location_key
+        _write_trace_record(corpus, query, env, {
+            "thread_id": thread_id, "location": location_key, "balance": balance})
+        env.pop("trace", None)   # debug-only; keep the client payload lean
+        env.pop("plan", None)
+        self._sse("done", env)
 
     def _handle_source(self, qs):
         raw_corpus = (qs.get("corpus") or [""])[0]
@@ -704,7 +887,10 @@ def start_server(port=None, host="127.0.0.1"):
         sys.stderr.write("[docrag] port %d busy; scanning\n" % port)
         port = _find_port(port)
 
-    server = http.server.HTTPServer((host, port), DocRagHandler)
+    # Threaded so one slow agentic answer (or a stalled SSE client) never blocks
+    # other requests -- critical now that answers stream for tens of seconds and
+    # the app is shared over the tailnet.
+    server = http.server.ThreadingHTTPServer((host, port), DocRagHandler)
     _write_pid_file(os.getpid(), port)
 
     def _on_sigint(_s, _f):

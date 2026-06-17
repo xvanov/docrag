@@ -23,6 +23,13 @@ from __future__ import annotations
 import glob
 import os
 
+# Keep tool calls responsive: never let a first query block on the cross-encoder
+# reranker loading/DOWNLOADING its model mid-call (the README flags CPU rerank as
+# minutes-slow, and on a CUDA box `auto` would fetch a ~2GB model on first use --
+# the classic multi-minute "stuck" symptom inside an MCP tool). RRF-only is the
+# documented default; set DOCRAG_RERANK=1 before launch to opt back in.
+os.environ.setdefault("DOCRAG_RERANK", "0")
+
 from mcp.server.fastmcp import FastMCP
 
 from . import settings

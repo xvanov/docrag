@@ -22,8 +22,27 @@ from __future__ import annotations
 
 import asyncio
 import glob
+import logging
 import os
+import sys
 from concurrent.futures import TimeoutError as _FTimeout
+
+# CRITICAL for stdio MCP: STDOUT is the JSON-RPC protocol channel. Any library
+# that logs to stdout corrupts the stream and, once the OS pipe buffer fills,
+# BLOCKS the writing thread mid-call -- which presents as a multi-minute "stuck"
+# tool call (the same query runs in ~20s called directly, but stalls over
+# stdio). The openai/httpx clients emit INFO "HTTP Request: ..." logs (often via
+# a rich handler bound to stdout). Per-logger setLevel proved insufficient, so
+# hard-disable everything at INFO and below GLOBALLY, force the remaining
+# WARNING+ records to stderr, and point any rich/console output at stderr too.
+os.environ.setdefault("PYTHONUNBUFFERED", "1")
+logging.basicConfig(level=logging.WARNING, stream=sys.stderr, force=True)
+logging.disable(logging.INFO)            # global: drop all INFO/DEBUG records
+for _h in list(logging.getLogger().handlers):
+    try:
+        _h.setStream(sys.stderr)         # any root handler -> stderr, never stdout
+    except Exception:  # noqa: BLE001
+        pass
 
 # Keep tool calls responsive: never let a first query block on the cross-encoder
 # reranker loading/DOWNLOADING its model mid-call (the README flags CPU rerank as
@@ -35,6 +54,20 @@ os.environ.setdefault("DOCRAG_RERANK", "0")
 from mcp.server.fastmcp import FastMCP
 
 from . import settings
+
+# Import the full retrieval/answer stack EAGERLY, in the MAIN thread, at module
+# load -- NOT lazily inside a tool. These pull heavy native extensions (numpy via
+# sqlite-vec; torch via the reranker import chain). Importing them for the first
+# time inside a worker thread (run_in_executor) deadlocks on CPython's import
+# lock against the FastMCP event-loop thread: the stdio server hangs on
+# `import numpy` and the tool call never returns (confirmed by a thread-stack
+# dump). Doing it here pays the ~15s cost once at startup; every tool call then
+# only CALLS already-imported code, so the worker never imports.
+from . import facets                       # noqa: E402
+from .db import open_db                    # noqa: E402
+from .query import rag_query               # noqa: E402
+from .answer import answer as _answer_fast    # noqa: E402  single-pass synthesis
+from .reason import answer as _answer_deep    # noqa: E402  agentic hypothesize->verify
 
 mcp = FastMCP("docrag")
 
@@ -58,8 +91,6 @@ def _location_filters(corpus: str, location: str) -> dict:
     server: the location (jurisdiction-tier) selector plus each document's
     latest edition. Returns {"location", "versions"}; versions is best-effort
     (empty if the index can't be opened)."""
-    from . import facets
-    from .db import open_db
     eff_versions: dict = {}
     try:
         conn = open_db(corpus)
@@ -105,7 +136,7 @@ def _fmt_authorities(authorities: list[dict]) -> str:
 @mcp.tool()
 async def docrag_ask(question: str, corpus: str = "building-codes",
                      balance: bool = True, top_k: int = 15,
-                     location: str = "durham-nc") -> str:
+                     location: str = "durham-nc", deep: bool = False) -> str:
     """Ask the docrag corpus a question and get a GROUNDED, CITED answer.
 
     Use this to ground or verify any claim about the building codes / statutes /
@@ -142,11 +173,12 @@ async def docrag_ask(question: str, corpus: str = "building-codes",
     def _work():
         # All blocking work (filters, the heavy reason/query import, retrieval +
         # LLM synthesis) runs in the worker thread so the event loop stays free.
+        # Default = fast single-pass synthesis (~1 chat call): responsive and
+        # robust to backend throttling. deep=True = the agentic hypothesize->
+        # verify pipeline (~several chat calls; slower, higher-quality), matching
+        # the web UI. Both are grounded + cited + jurisdiction-balanced.
         filters = _location_filters(corpus, location) if corpus in _BALANCED else None
-        if use_balance:
-            from .reason import answer as ans
-        else:
-            from .answer import answer as ans
+        ans = _answer_deep if (deep and use_balance) else _answer_fast
         return ans(corpus=corpus, query=question, top_k=top_k,
                    balance=use_balance, filters=filters, location=location)
 
@@ -195,7 +227,6 @@ async def docrag_sources(question: str, corpus: str = "building-codes",
 
     def _work():
         filters = _location_filters(corpus, location) if corpus in _BALANCED else None
-        from .query import rag_query
         return rag_query(corpus, question, top_k=top_k, filters=filters,
                          balance=corpus in _BALANCED)
 
@@ -236,6 +267,13 @@ def docrag_corpora() -> str:
 
 
 def main() -> None:
+    # Diagnostic (opt-in): dump all thread stacks to a file every N seconds so a
+    # stall inside the stdio server can be located. DOCRAG_MCP_FAULTDUMP=<path>.
+    _fd = os.environ.get("DOCRAG_MCP_FAULTDUMP")
+    if _fd:
+        import faulthandler
+        _f = open(_fd, "w", encoding="utf-8")
+        faulthandler.dump_traceback_later(20, repeat=True, file=_f)
     mcp.run()  # stdio transport
 
 

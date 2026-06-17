@@ -20,9 +20,10 @@ Register in Claude Code via .mcp.json at the repo root (already provided), or:
 
 from __future__ import annotations
 
+import asyncio
 import glob
 import os
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as _FTimeout
+from concurrent.futures import TimeoutError as _FTimeout
 
 # Keep tool calls responsive: never let a first query block on the cross-encoder
 # reranker loading/DOWNLOADING its model mid-call (the README flags CPU rerank as
@@ -75,19 +76,21 @@ def _tool_timeout() -> float:
     return float(settings.get("DOCRAG_TOOL_TIMEOUT", 150) or 150)
 
 
-def _run_bounded(fn):
-    """Run a blocking call with a hard wall-clock cap so a stalled backend can
-    never hang the MCP client indefinitely. On timeout raise _FTimeout and
-    return immediately -- do NOT wait on the worker. (A `with ThreadPoolExecutor`
-    block would call shutdown(wait=True) on exit and re-block on the hung thread,
-    defeating the timeout; that was the original 30-minute hang.) The abandoned
-    worker dies on its own once the Azure client's 60s timeout fires."""
-    ex = ThreadPoolExecutor(max_workers=1)
-    fut = ex.submit(fn)
+async def _run_bounded(fn):
+    """Run a blocking call in a worker thread with a hard wall-clock cap, the
+    RELIABLE way under FastMCP: the tool is async, so the asyncio event loop
+    (which serves the stdio protocol) keeps control and can deliver the result
+    or the timeout. ``asyncio.wait_for`` cancels the await at the cap; the
+    abandoned executor thread dies on its own once the Azure client's own
+    timeout fires. (A synchronous ThreadPoolExecutor.result(timeout) inside a
+    sync tool did NOT reliably return under FastMCP -- hence the indefinite
+    'stuck' even with a cap.) Raises _FTimeout on timeout."""
+    loop = asyncio.get_event_loop()
     try:
-        return fut.result(timeout=_tool_timeout())
-    finally:
-        ex.shutdown(wait=False)
+        return await asyncio.wait_for(loop.run_in_executor(None, fn),
+                                      timeout=_tool_timeout())
+    except (asyncio.TimeoutError, TimeoutError) as e:
+        raise _FTimeout from e
 
 
 def _fmt_authorities(authorities: list[dict]) -> str:
@@ -100,9 +103,9 @@ def _fmt_authorities(authorities: list[dict]) -> str:
 
 
 @mcp.tool()
-def docrag_ask(question: str, corpus: str = "building-codes",
-               balance: bool = True, top_k: int = 15,
-               location: str = "durham-nc") -> str:
+async def docrag_ask(question: str, corpus: str = "building-codes",
+                     balance: bool = True, top_k: int = 15,
+                     location: str = "durham-nc") -> str:
     """Ask the docrag corpus a question and get a GROUNDED, CITED answer.
 
     Use this to ground or verify any claim about the building codes / statutes /
@@ -135,18 +138,20 @@ def docrag_ask(question: str, corpus: str = "building-codes",
     top_k = max(3, min(int(top_k or 15), 20))
     use_balance = bool(balance) and corpus in _BALANCED
     location = (location or "durham-nc").strip().lower()
-    filters = _location_filters(corpus, location) if corpus in _BALANCED else None
 
-    # Agentic hypothesize-verify for the balanced corpus; plain synthesis else.
-    if use_balance:
-        from .reason import answer as ans
-    else:
-        from .answer import answer as ans
+    def _work():
+        # All blocking work (filters, the heavy reason/query import, retrieval +
+        # LLM synthesis) runs in the worker thread so the event loop stays free.
+        filters = _location_filters(corpus, location) if corpus in _BALANCED else None
+        if use_balance:
+            from .reason import answer as ans
+        else:
+            from .answer import answer as ans
+        return ans(corpus=corpus, query=question, top_k=top_k,
+                   balance=use_balance, filters=filters, location=location)
 
     try:
-        res = _run_bounded(lambda: ans(
-            corpus=corpus, query=question, top_k=top_k, balance=use_balance,
-            filters=filters, location=location))
+        res = await _run_bounded(_work)
     except _FTimeout:
         return ("ERROR: docrag timed out (>%ds) -- the LLM/embedding backend was "
                 "slow or unreachable. Try again, or proceed from other sources."
@@ -165,8 +170,8 @@ def docrag_ask(question: str, corpus: str = "building-codes",
 
 
 @mcp.tool()
-def docrag_sources(question: str, corpus: str = "building-codes",
-                   top_k: int = 12, location: str = "durham-nc") -> str:
+async def docrag_sources(question: str, corpus: str = "building-codes",
+                         top_k: int = 12, location: str = "durham-nc") -> str:
     """Retrieve raw corpus passages for a query WITHOUT the LLM synthesis layer.
 
     Use when you want to read the actual provision text yourself and reason over
@@ -187,12 +192,15 @@ def docrag_sources(question: str, corpus: str = "building-codes",
         return "ERROR: empty question."
     top_k = max(3, min(int(top_k or 12), 20))
     location = (location or "durham-nc").strip().lower()
-    filters = _location_filters(corpus, location) if corpus in _BALANCED else None
-    from .query import rag_query
+
+    def _work():
+        filters = _location_filters(corpus, location) if corpus in _BALANCED else None
+        from .query import rag_query
+        return rag_query(corpus, question, top_k=top_k, filters=filters,
+                         balance=corpus in _BALANCED)
+
     try:
-        r = _run_bounded(lambda: rag_query(
-            corpus, question, top_k=top_k, filters=filters,
-            balance=corpus in _BALANCED))
+        r = await _run_bounded(_work)
     except _FTimeout:
         return "ERROR: docrag retrieval timed out (>%ds)." % int(_tool_timeout())
     except FileNotFoundError:

@@ -336,10 +336,16 @@ def _chat_client():
         raise EnvironmentError(
             "AZURE_OPENAI_ENDPOINT and AZURE_OPENAI_API_KEY must be set."
         )
+    # Bound every chat call: the SDK default 600s timeout (+ retries) means a
+    # single stalled request can freeze a query / MCP tool call for 10-30 min.
+    # Our own _chat_with_backoff handles transient retries, so cap hard here.
+    # Override via DOCRAG_HTTP_TIMEOUT.
     return AzureOpenAI(
         azure_endpoint=endpoint,
         api_key=api_key,
         api_version=settings.azure_api_version(),
+        timeout=float(settings.get("DOCRAG_HTTP_TIMEOUT", 60) or 60),
+        max_retries=2,
     )
 
 

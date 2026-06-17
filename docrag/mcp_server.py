@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import glob
 import os
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as _FTimeout
 
 # Keep tool calls responsive: never let a first query block on the cross-encoder
 # reranker loading/DOWNLOADING its model mid-call (the README flags CPU rerank as
@@ -51,6 +52,44 @@ def _list_corpora() -> list[str]:
     return out
 
 
+def _location_filters(corpus: str, location: str) -> dict:
+    """Build the retrieval ``filters`` dict for a location, mirroring the web
+    server: the location (jurisdiction-tier) selector plus each document's
+    latest edition. Returns {"location", "versions"}; versions is best-effort
+    (empty if the index can't be opened)."""
+    from . import facets
+    from .db import open_db
+    eff_versions: dict = {}
+    try:
+        conn = open_db(corpus)
+        try:
+            eff_versions = facets.resolve_versions(conn, {})
+        finally:
+            conn.close()
+    except Exception:  # noqa: BLE001 -- versions are optional sugar
+        eff_versions = {}
+    return {"location": facets.location(location)["key"], "versions": eff_versions}
+
+
+def _tool_timeout() -> float:
+    return float(settings.get("DOCRAG_TOOL_TIMEOUT", 150) or 150)
+
+
+def _run_bounded(fn):
+    """Run a blocking call with a hard wall-clock cap so a stalled backend can
+    never hang the MCP client indefinitely. On timeout raise _FTimeout and
+    return immediately -- do NOT wait on the worker. (A `with ThreadPoolExecutor`
+    block would call shutdown(wait=True) on exit and re-block on the hung thread,
+    defeating the timeout; that was the original 30-minute hang.) The abandoned
+    worker dies on its own once the Azure client's 60s timeout fires."""
+    ex = ThreadPoolExecutor(max_workers=1)
+    fut = ex.submit(fn)
+    try:
+        return fut.result(timeout=_tool_timeout())
+    finally:
+        ex.shutdown(wait=False)
+
+
 def _fmt_authorities(authorities: list[dict]) -> str:
     if not authorities:
         return ""
@@ -62,15 +101,17 @@ def _fmt_authorities(authorities: list[dict]) -> str:
 
 @mcp.tool()
 def docrag_ask(question: str, corpus: str = "building-codes",
-               balance: bool = True, top_k: int = 15) -> str:
+               balance: bool = True, top_k: int = 15,
+               location: str = "durham-nc") -> str:
     """Ask the docrag corpus a question and get a GROUNDED, CITED answer.
 
     Use this to ground or verify any claim about the building codes / statutes /
-    ordinances in the corpus (IBC, NC State Building Code, NC statutes, Durham
-    UDO). The answer is synthesized only from retrieved provisions and every
-    claim carries a [N] citation mapped to a named authority. Treat it as the
-    authoritative local-law layer; pair it with your own web search for
-    real-world precedent, current process/fees, or anything the corpus lacks.
+    ordinances in the corpus (IBC, NC State Building Code, NC statutes, and the
+    local land-use ordinances). The answer is synthesized only from retrieved
+    provisions and every claim carries a [N] citation mapped to a named
+    authority. Treat it as the authoritative local-law layer; pair it with your
+    own web search for real-world precedent, current process/fees, or anything
+    the corpus lacks.
 
     Args:
         question: A natural-language question. Lay phrasing is fine -- retrieval
@@ -79,6 +120,13 @@ def docrag_ask(question: str, corpus: str = "building-codes",
         balance: Balance retrieval across model/state/local layers (default
             True; only meaningful for the multi-source building-codes corpus).
         top_k: Sections to retrieve (3-20).
+        location: Which jurisdiction's LOCAL layer to stack on the shared
+            model/state/federal codes. The model+NC-state+federal layers are
+            always included; this selects which local ordinance applies so a
+            Durham question never sees Alamance ordinances and vice versa.
+            Valid: "durham-nc" (default), "alamance-county-nc" (unincorporated
+            Alamance), "burlington-nc", "graham-nc", "alamance-towns-nc",
+            "north-carolina" (statewide, no local layer), "model" (I-Codes only).
     """
     corpus = (corpus or "building-codes").strip().lower()
     question = (question or "").strip()
@@ -86,6 +134,8 @@ def docrag_ask(question: str, corpus: str = "building-codes",
         return "ERROR: empty question."
     top_k = max(3, min(int(top_k or 15), 20))
     use_balance = bool(balance) and corpus in _BALANCED
+    location = (location or "durham-nc").strip().lower()
+    filters = _location_filters(corpus, location) if corpus in _BALANCED else None
 
     # Agentic hypothesize-verify for the balanced corpus; plain synthesis else.
     if use_balance:
@@ -94,7 +144,13 @@ def docrag_ask(question: str, corpus: str = "building-codes",
         from .answer import answer as ans
 
     try:
-        res = ans(corpus=corpus, query=question, top_k=top_k, balance=use_balance)
+        res = _run_bounded(lambda: ans(
+            corpus=corpus, query=question, top_k=top_k, balance=use_balance,
+            filters=filters, location=location))
+    except _FTimeout:
+        return ("ERROR: docrag timed out (>%ds) -- the LLM/embedding backend was "
+                "slow or unreachable. Try again, or proceed from other sources."
+                % int(_tool_timeout()))
     except FileNotFoundError:
         return ("ERROR: corpus %r has no built index. Available: %s"
                 % (corpus, ", ".join(_list_corpora()) or "(none)"))
@@ -110,7 +166,7 @@ def docrag_ask(question: str, corpus: str = "building-codes",
 
 @mcp.tool()
 def docrag_sources(question: str, corpus: str = "building-codes",
-                   top_k: int = 12) -> str:
+                   top_k: int = 12, location: str = "durham-nc") -> str:
     """Retrieve raw corpus passages for a query WITHOUT the LLM synthesis layer.
 
     Use when you want to read the actual provision text yourself and reason over
@@ -121,16 +177,24 @@ def docrag_sources(question: str, corpus: str = "building-codes",
         question: What to search for.
         corpus: Corpus name (default "building-codes").
         top_k: Number of sections (3-20).
+        location: Jurisdiction whose local layer to include (see docrag_ask).
+            "durham-nc" (default), "alamance-county-nc", "burlington-nc",
+            "graham-nc", "alamance-towns-nc", "north-carolina", "model".
     """
     corpus = (corpus or "building-codes").strip().lower()
     question = (question or "").strip()
     if not question:
         return "ERROR: empty question."
     top_k = max(3, min(int(top_k or 12), 20))
+    location = (location or "durham-nc").strip().lower()
+    filters = _location_filters(corpus, location) if corpus in _BALANCED else None
     from .query import rag_query
     try:
-        r = rag_query(corpus, question, top_k=top_k,
-                      balance=corpus in _BALANCED)
+        r = _run_bounded(lambda: rag_query(
+            corpus, question, top_k=top_k, filters=filters,
+            balance=corpus in _BALANCED))
+    except _FTimeout:
+        return "ERROR: docrag retrieval timed out (>%ds)." % int(_tool_timeout())
     except FileNotFoundError:
         return ("ERROR: corpus %r has no built index. Available: %s"
                 % (corpus, ", ".join(_list_corpora()) or "(none)"))

@@ -45,10 +45,15 @@ def _client():
             "AZURE_OPENAI_ENDPOINT and AZURE_OPENAI_API_KEY must be set "
             "(see .env.example)."
         )
+    # Bound every call: the SDK default is a 600s timeout with retries, so one
+    # stalled request would freeze a query (and an MCP tool call) for many
+    # minutes. Cap it. Override via DOCRAG_HTTP_TIMEOUT.
     return AzureOpenAI(
         azure_endpoint=endpoint,
         api_key=api_key,
         api_version=settings.azure_api_version(),
+        timeout=float(settings.get("DOCRAG_HTTP_TIMEOUT", 60) or 60),
+        max_retries=2,
     )
 
 

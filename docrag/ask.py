@@ -34,6 +34,10 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="docrag.ask")
     ap.add_argument("query", nargs="+", help="the question")
     ap.add_argument("--corpus", default="building-codes")
+    ap.add_argument("--location", default="durham-nc",
+                    help="jurisdiction local layer: durham-nc, "
+                         "alamance-county-nc, burlington-nc, graham-nc, "
+                         "alamance-towns-nc, north-carolina, model")
     ap.add_argument("--top-k", type=int, default=15)
     ap.add_argument("--no-balance", action="store_true",
                     help="disable jurisdiction-balanced retrieval")
@@ -49,9 +53,26 @@ def main(argv=None) -> int:
     corpus = args.corpus.strip().lower()
     query = " ".join(args.query).strip()
     balance = (corpus in _BALANCED_CORPORA) and not args.no_balance
+    location = (args.location or "durham-nc").strip().lower()
+
+    filters = None
+    if corpus in _BALANCED_CORPORA:
+        from . import facets
+        from .db import open_db
+        try:
+            conn = open_db(corpus)
+            try:
+                eff_versions = facets.resolve_versions(conn, {})
+            finally:
+                conn.close()
+        except Exception:  # noqa: BLE001
+            eff_versions = {}
+        filters = {"location": facets.location(location)["key"],
+                   "versions": eff_versions}
 
     if args.sources:
-        r = rag_query(corpus, query, top_k=args.top_k, balance=balance)
+        r = rag_query(corpus, query, top_k=args.top_k, balance=balance,
+                      filters=filters)
         if not r.get("results"):
             print("(no results: %s)" % r.get("status"))
             return 0
@@ -65,7 +86,7 @@ def main(argv=None) -> int:
     else:
         rag_answer_fn = rag_answer
     res = rag_answer_fn(corpus=corpus, query=query, top_k=args.top_k,
-                        balance=balance)
+                        balance=balance, filters=filters, location=location)
     if res.get("refused"):
         print("No grounded answer (%s)." % res.get("refusal_reason"))
         if res.get("chunks"):

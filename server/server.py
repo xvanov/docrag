@@ -386,6 +386,16 @@ class DocRagHandler(http.server.BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):  # noqa: A002
         pass
 
+    def handle(self):
+        # Clients (mobile / tailnet) routinely drop a connection mid-response;
+        # on Windows that surfaces as WinError 10053/10054. Swallow those so a
+        # normal disconnect doesn't dump a traceback or look like a crash. The
+        # threaded server isolates the thread either way.
+        try:
+            super().handle()
+        except (ConnectionError, socket.timeout):
+            pass
+
     def _send_json(self, data, status=200):
         body = json.dumps(data, ensure_ascii=True).encode("utf-8")
         self.send_response(status)

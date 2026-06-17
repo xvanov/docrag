@@ -34,7 +34,16 @@ _TIER_RULES = (
     (lambda j: j == "federal", "federal"),
     (lambda j: j == "north-carolina" or j == "nc-state" or j == "ncdot"
      or j.startswith("nc-") or j.startswith("nc_"), "state"),
-    (lambda j: j == "durham" or j.startswith("durham"), "local"),
+    # Local tiers are jurisdiction-specific so each LOCATION stacks only its own
+    # local layer (a Durham question must never see Alamance ordinances, etc.).
+    # NEW local jurisdiction folders MUST get an explicit rule here -- otherwise
+    # they fall to "other", which the durham-nc location treats as broadly
+    # applicable and would leak them into Durham answers.
+    (lambda j: j == "durham" or j.startswith("durham"), "local-durham"),
+    (lambda j: j == "alamance-towns", "local-alamance-towns"),
+    (lambda j: j == "alamance" or j.startswith("alamance"), "local-alamance"),
+    (lambda j: j == "burlington", "local-burlington"),
+    (lambda j: j == "graham", "local-graham"),
 )
 
 
@@ -48,8 +57,22 @@ def tier_of(jurisdiction: str) -> str:
 
 LOCATIONS = [
     {"key": "durham-nc", "label": "Durham, NC",
-     "tiers": {"model", "federal", "state", "local", "other"},
+     "tiers": {"model", "federal", "state", "local-durham", "other"},
      "answer_location": "Durham, North Carolina"},
+    {"key": "alamance-county-nc", "label": "Alamance County, NC (unincorporated)",
+     "tiers": {"model", "federal", "state", "local-alamance", "other"},
+     "answer_location": "unincorporated Alamance County, North Carolina"},
+    {"key": "burlington-nc", "label": "Burlington, NC (Alamance County)",
+     "tiers": {"model", "federal", "state", "local-burlington", "other"},
+     "answer_location": "the City of Burlington, North Carolina (Alamance County)"},
+    {"key": "graham-nc", "label": "Graham, NC (Alamance County)",
+     "tiers": {"model", "federal", "state", "local-graham", "other"},
+     "answer_location": "the City of Graham, North Carolina (Alamance County)"},
+    {"key": "alamance-towns-nc", "label": "Alamance County small towns",
+     "tiers": {"model", "federal", "state", "local-alamance-towns", "other"},
+     "answer_location": "the smaller incorporated towns of Alamance County, "
+                        "North Carolina (Haw River, Swepsonville, Green Level, "
+                        "Village of Alamance)"},
     {"key": "north-carolina", "label": "North Carolina (statewide)",
      "tiers": {"model", "federal", "state", "other"},
      "answer_location": "North Carolina"},
@@ -130,6 +153,13 @@ def facet_of(path: str, edition: str | None = None) -> dict:
     elif juris == "durham":
         family = "udo"
         year = _year_from(edition or "") or _year_from(p)
+    elif juris in ("alamance", "alamance-towns", "burlington", "graham"):
+        # Local Alamance-area jurisdictions: derive a stable family slug from the
+        # filename stem so each document groups under its own doc_key.
+        base = segs[-1] if len(segs) > 1 else juris
+        family = re.sub(r"[^a-z0-9]+", "-", os.path.splitext(base.lower())[0]).strip("-") \
+            or juris
+        year = _year_from(base) or _year_from(edition or "") or _year_from(p)
     else:
         family = (segs[1].lower() if len(segs) > 1 else juris)
         year = _year_from(edition or "") or _year_from(p)
@@ -147,6 +177,14 @@ def doc_label(jurisdiction: str, family: str, edition: str | None = None) -> str
         return _NC_FAMILY_NAMES.get(family, "NC " + family.upper())
     if jurisdiction == "durham":
         return "Durham UDO"
+    _LOCAL_NAMES = {
+        "alamance": "Alamance County", "alamance-towns": "Alamance County town",
+        "burlington": "City of Burlington", "graham": "City of Graham",
+    }
+    if jurisdiction in _LOCAL_NAMES:
+        pretty = (family or "").replace("-", " ").strip().title()
+        return ("%s — %s" % (_LOCAL_NAMES[jurisdiction], pretty)).strip(" —") \
+            or _LOCAL_NAMES[jurisdiction]
     # fall back to a year-stripped edition label
     if edition:
         return re.sub(r"\b(19|20)\d{2}\b", "", edition).strip(" -:") or edition

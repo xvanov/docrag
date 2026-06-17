@@ -1,4 +1,5 @@
 openai>=1.40.0
+mcp>=1.2.0                    # MCP server exposing docrag as agent tools (docrag/mcp_server.py)
 sqlite-vec>=0.1.6
 python-dotenv>=1.0.0
 PyPDF2>=3.0.0

@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import re
 
+from ... import settings
 from ...core.chat import get_chat_provider
 from ...db import open_db
 from ...query import rag_query
@@ -21,6 +22,32 @@ from . import prompts
 _CITE_RE = re.compile(r"\[\s*(\d+(?:\s*,\s*\d+)*)\s*\]")
 ANSWER_MAX_TOKENS = 1200
 LONGCTX_CHAR_BUDGET = 2_400_000   # ~600k tokens of transcript; guard the prompt
+
+
+def resolve_chat() -> tuple[str, str | None]:
+    """Pick the chat backend for the youtube domain.
+
+    Explicit override: RAG_YOUTUBE_CHAT_PROVIDER (azure|claude) +
+    RAG_YOUTUBE_CHAT_MODEL. Otherwise: Claude if ANTHROPIC_API_KEY is set, else
+    fall back to Azure if its credentials are present (so a youtube corpus can
+    run entirely on Azure infra). Returns (provider_name, model_or_None).
+    """
+    name = (settings.get("RAG_YOUTUBE_CHAT_PROVIDER", "") or "").strip().lower()
+    if not name:
+        if settings.get("ANTHROPIC_API_KEY", ""):
+            name = "claude"
+        elif settings.azure_endpoint() and settings.azure_api_key():
+            name = "azure"
+        else:
+            name = "claude"
+    if name == "azure":
+        # None -> AzureChat uses chat_deployment_synthesis().
+        model = settings.get("RAG_YOUTUBE_CHAT_MODEL", "") or None
+    else:
+        model = (settings.get("RAG_YOUTUBE_CHAT_MODEL", "")
+                 or settings.get("RAG_CLAUDE_MODEL", "claude-opus-4-8")
+                 or "claude-opus-4-8")
+    return name, model
 
 
 def excerpt_label(c: dict) -> str:
@@ -77,7 +104,8 @@ def single_answer(corpus: str, query: str, model: str | None = None,
             messages.append({"role": turn["role"], "content": turn["content"]})
     messages.append({"role": "user", "content": user})
 
-    provider = get_chat_provider("claude", model=model)
+    name, mdl = resolve_chat()
+    provider = get_chat_provider(name, model=model or mdl)
     result = provider.complete(system=prompts.ANSWER_SYSTEM, messages=messages,
                                max_tokens=ANSWER_MAX_TOKENS)
     text = result.text
@@ -136,8 +164,10 @@ def longctx_answer(corpus: str, query: str, model: str | None = None) -> dict:
                 "[VIDEO n] with its title and url. Cite [VIDEO n] and an "
                 "approximate timestamp/quote for each claim.\n\n"
               + corpus_block)
-    provider = get_chat_provider("claude", model=model)
-    # Cache the (large, stable) corpus prefix so repeat questions are cheap.
+    name, mdl = resolve_chat()
+    provider = get_chat_provider(name, model=model or mdl)
+    # cache_system caches the (large, stable) corpus prefix on Claude; it's a
+    # harmless no-op on Azure.
     result = provider.complete(system=system,
                                messages=[{"role": "user", "content": query}],
                                max_tokens=ANSWER_MAX_TOKENS, cache_system=True)

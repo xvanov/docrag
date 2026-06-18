@@ -60,7 +60,14 @@ def mapreduce_answer(corpus: str, query: str, target: str | None = None,
     ``target`` is what to extract per video (e.g. "predictions about geopolitics");
     defaults to the query itself."""
     target = (target or query).strip()
-    model = model or settings.get("RAG_CLAUDE_MODEL", "claude-opus-4-8") or "claude-opus-4-8"
+    from .answer import resolve_chat
+    provider_name, resolved_model = resolve_chat()
+    if provider_name == "azure":
+        model = model or resolved_model or settings.chat_deployment_synthesis()
+    else:
+        model = model or resolved_model or "claude-opus-4-8"
+    # ``model`` is both the provider model/deployment AND part of the
+    # extraction_cache key (so switching backend/model is a clean cache miss).
     extraction_kind = "mapreduce:" + _slug(target)
 
     conn = open_db(corpus)
@@ -69,11 +76,11 @@ def mapreduce_answer(corpus: str, query: str, target: str | None = None,
         if not videos:
             return _refused([], "no_transcripts", "no_results")
 
-        provider = get_chat_provider("claude", model=model)
+        provider = get_chat_provider(provider_name, model=model)
         map_system = prompts.MAP_SYSTEM_TEMPLATE.format(target=target)
 
         all_items: list[dict] = []
-        cache_hits = mapped = 0
+        cache_hits = mapped = failed = 0
         for v in videos:
             path = v["path"]
             chash = (conn.execute("SELECT sha256 FROM files WHERE path=?", (path,))
@@ -87,14 +94,27 @@ def mapreduce_answer(corpus: str, query: str, target: str | None = None,
                 user = prompts.MAP_USER_TEMPLATE.format(
                     title=v["title"], channel=v.get("channel") or "",
                     transcript=transcript)
-                res = provider.complete(system=map_system,
-                                        messages=[{"role": "user", "content": user}],
-                                        max_tokens=MAP_MAX_TOKENS)
-                items = _parse_items(res.text)
-                put_extraction(conn, path, corpus, chash or "", extraction_kind,
-                               model, items)
-                conn.commit()
-                mapped += 1
+                # One video must never sink the whole exhaustive run: a transient
+                # error or an Azure content-filter rejection (Zeihan covers wars,
+                # which trip the violence filter) is logged and skipped, not
+                # cached -- so a later run can retry it.
+                try:
+                    res = provider.complete(
+                        system=map_system,
+                        messages=[{"role": "user", "content": user}],
+                        max_tokens=MAP_MAX_TOKENS)
+                    items = _parse_items(res.text)
+                    put_extraction(conn, path, corpus, chash or "",
+                                   extraction_kind, model, items)
+                    conn.commit()
+                    mapped += 1
+                except Exception as e:  # noqa: BLE001
+                    import sys
+                    reason = "content_filter" if "content_filter" in str(e) else \
+                        str(e).splitlines()[0][:120]
+                    sys.stderr.write("[mapreduce] skip %s (%s)\n" % (path, reason))
+                    failed += 1
+                    continue
             for it in items:
                 it = dict(it)
                 it["_video"] = {"title": v["title"], "url": v.get("url"),
@@ -108,17 +128,30 @@ def mapreduce_answer(corpus: str, query: str, target: str | None = None,
                 % (target, len(videos)), "citations": [], "chunks": [],
                 "refused": False, "refusal_reason": None, "status": "ok",
                 "stats": {"videos": len(videos), "items": 0,
-                          "cache_hits": cache_hits, "mapped": mapped}}
+                          "cache_hits": cache_hits, "mapped": mapped,
+                          "failed": failed}}
 
+    stats = {"videos": len(videos), "items": len(all_items),
+             "cache_hits": cache_hits, "mapped": mapped, "failed": failed}
     reduce_system = prompts.REDUCE_SYSTEM_TEMPLATE.format(query=query)
     reduce_user = ("Items (JSON):\n%s\n\nWrite the final answer now."
                    % json.dumps(all_items, ensure_ascii=False))
-    provider = get_chat_provider("claude", model=model)
-    res = provider.complete(system=reduce_system,
-                            messages=[{"role": "user", "content": reduce_user}],
-                            max_tokens=REDUCE_MAX_TOKENS)
+    provider = get_chat_provider(provider_name, model=model)
+    try:
+        res = provider.complete(system=reduce_system,
+                                messages=[{"role": "user", "content": reduce_user}],
+                                max_tokens=REDUCE_MAX_TOKENS)
+    except Exception as e:  # noqa: BLE001 -- synthesis filtered/failed: return raw items
+        lines = []
+        for it in all_items:
+            v = it.get("_video") or {}
+            lines.append("- %s [%s](%s)" % (it.get("claim") or it.get("quote") or "",
+                                            v.get("title") or "", v.get("url") or ""))
+        note = "(synthesis step failed: %s; returning the raw extracted items)" % (
+            "content_filter" if "content_filter" in str(e) else str(e).splitlines()[0][:120])
+        return {"answer": note + "\n\n" + "\n".join(lines), "citations": [],
+                "chunks": [], "refused": False, "refusal_reason": "reduce_failed",
+                "status": "ok", "stats": stats}
     return {"answer": res.text, "citations": [], "chunks": [], "refused": False,
-            "refusal_reason": None, "status": "ok",
-            "stats": {"videos": len(videos), "items": len(all_items),
-                      "cache_hits": cache_hits, "mapped": mapped},
+            "refusal_reason": None, "status": "ok", "stats": stats,
             "tokens": {"prompt": res.prompt_tokens, "completion": res.completion_tokens}}

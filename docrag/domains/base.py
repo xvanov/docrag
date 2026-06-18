@@ -72,3 +72,11 @@ class Domain:
     def citation_label(self, result: dict) -> str:
         """Human-readable provenance for a retrieved result. Override per domain."""
         return result.get("source_file") or result.get("path") or "unknown"
+
+    def answer(self, corpus: str, query: str, strategy: str | None = None,
+               history: list[dict] | None = None, top_k: int = 12, **kw) -> dict:
+        """Produce a grounded, cited answer dict. Override per domain.
+
+        Returns at least {answer, citations, chunks, refused, refusal_reason,
+        status, tokens}."""
+        raise NotImplementedError("%s.answer is not implemented" % self.name)

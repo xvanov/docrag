@@ -40,5 +40,19 @@ class BuildingCodesDomain(Domain):
         from ... import answer  # lazy: keeps openai out of non-azure imports
         return answer._chunk_label(result)
 
+    def answer(self, corpus: str, query: str, strategy: str | None = None,
+               history: list[dict] | None = None, top_k: int = 12,
+               location: str | None = None, **kw) -> dict:
+        # Preserve the existing building-codes behavior exactly: balanced
+        # retrieval, agentic by default, single-pass when asked.
+        strat = strategy or self.default_strategy(query)
+        if strat == STRATEGY_AGENTIC:
+            from ... import reason
+            return reason.answer(corpus, query, history=history, top_k=top_k,
+                                 balance=True, location=location)
+        from ... import answer as answer_mod
+        return answer_mod.answer(corpus, query, history=history, top_k=top_k,
+                                 balance=True, location=location)
+
 
 DOMAIN = BuildingCodesDomain()

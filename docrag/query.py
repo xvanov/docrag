@@ -22,6 +22,7 @@ Public API:
 from __future__ import annotations
 
 import fnmatch
+import json
 import re
 import struct
 
@@ -94,6 +95,12 @@ def _jurisdiction_of(row: dict) -> str:
 
 
 def _row_to_result(row: dict, score: float, text: str, referenced: bool = False) -> dict:
+    meta = row.get("metadata")
+    if isinstance(meta, str):
+        try:
+            meta = json.loads(meta)
+        except (ValueError, TypeError):
+            meta = None
     return {
         "chunk_id": row.get("id"),
         "path": row.get("path"),
@@ -108,6 +115,7 @@ def _row_to_result(row: dict, score: float, text: str, referenced: bool = False)
         "breadcrumb": row.get("breadcrumb"),
         "jurisdiction": row.get("jurisdiction"),
         "edition": row.get("edition"),
+        "metadata": meta,            # domain-specific (youtube: start_time/url/...)
         "text": text,
         "score": score,
         "referenced": referenced,
@@ -293,7 +301,7 @@ def rag_query(corpus: str, query: str, top_k: int = 8,
         cur = conn.execute(
             "SELECT id, path, corpus, source_file, kind, page, start_line, "
             "end_line, text, section_id, section_number, section_title, "
-            "breadcrumb, jurisdiction, edition, node_type "
+            "breadcrumb, jurisdiction, edition, node_type, metadata "
             "FROM chunks WHERE id IN (%s)" % ph, ordered_ids,
         )
         cols = [d[0] for d in cur.description]

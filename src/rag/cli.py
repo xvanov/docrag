@@ -80,7 +80,7 @@ def _cmd_index(args) -> int:
             return 2
         langs = [s for s in (args.lang or "en").split(",") if s]
         return ingest(corpus, args.targets, languages=langs, limit=args.limit,
-                      full=args.full, dry_run=args.dry_run)
+                      full=args.full, dry_run=args.dry_run, sleep=args.sleep)
     # building-codes (and any filesystem domain): delegate to the index CLI.
     from . import index
     flags = []
@@ -142,6 +142,10 @@ def main(argv: list | None = None) -> int:
     pi.add_argument("--confirm", action="store_true", help="building-codes cost gate.")
     pi.add_argument("--limit", type=int, default=0)
     pi.add_argument("--lang", help="youtube transcript languages, comma-sep (default en).")
+    pi.add_argument("--sleep", type=float, default=None,
+                    help="youtube: seconds between transcript fetches "
+                         "(default RAG_YT_SLEEP=1.0). Raise to ~3-5 to avoid "
+                         "YouTube IP rate-limiting on large channels.")
 
     ps = sub.add_parser("status", help="Show corpus index stats.")
     ps.add_argument("--corpus", required=True)

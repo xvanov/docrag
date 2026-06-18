@@ -137,11 +137,32 @@ def _check_azure_creds() -> None:
     raise SystemExit(3)
 
 
+_BLOCK_RETRIES = 2            # per-video retries on an IP block
+_BLOCK_BACKOFF_S = 30.0       # base backoff; doubles each retry
+_MAX_CONSECUTIVE_BLOCKS = 4   # consecutive blocked videos -> abort the run
+
+
+def _is_ip_block(e: Exception) -> bool:
+    name = type(e).__name__.lower()
+    if "ipblocked" in name or "requestblocked" in name or "toomanyrequests" in name:
+        return True
+    s = str(e).lower()
+    return ("blocking requests from your ip" in s or "too many requests" in s
+            or "your ip has been blocked" in s)
+
+
 def ingest(corpus: str, targets: list[str], languages: list[str] | None = None,
            limit: int = 0, full: bool = False, confirm: bool = False,
-           dry_run: bool = False) -> int:
-    """Ingest ``targets`` (video/channel/playlist URLs or ids) into ``corpus``."""
+           dry_run: bool = False, sleep: float | None = None) -> int:
+    """Ingest ``targets`` (video/channel/playlist URLs or ids) into ``corpus``.
+
+    ``sleep`` paces transcript fetches (seconds between videos) to avoid tripping
+    YouTube's per-IP rate limiter; defaults to RAG_YT_SLEEP (1.0s). On a sustained
+    IP block the run backs off, then stops early so it doesn't churn through
+    thousands of failing requests -- re-run later and incremental resumes.
+    """
     languages = languages or ["en"]
+    sleep_s = float(settings.get("RAG_YT_SLEEP", 1.0) or 1.0) if sleep is None else sleep
     print("[corpus] %s  (index: %s)" % (corpus, settings.index_dir()))
     print("[enumerate] resolving %d target(s)..." % len(targets))
     videos = enumerate_targets(targets, limit=limit)
@@ -160,19 +181,57 @@ def ingest(corpus: str, targets: list[str], languages: list[str] | None = None,
         sys.stderr.write("[ingest] schema changed -> forcing --full\n")
         full = True
 
-    indexed = skipped = no_transcript = 0
+    indexed = skipped = no_transcript = blocked_skips = 0
     total_chunks = 0
+    consecutive_blocks = 0
+    aborted = False
     try:
         for vmeta in videos:
             vid = vmeta["video_id"]
             path = "yt:%s" % vid
-            try:
-                snippets, lang, is_gen = fetch_transcript(vid, languages)
-            except Exception as e:  # noqa: BLE001
-                sys.stderr.write("[ingest] no transcript for %s: %s\n"
-                                 % (vid, str(e).splitlines()[0][:160]))
-                no_transcript += 1
+
+            # Fetch with IP-block backoff/retry; non-block errors = no captions.
+            snippets = lang = is_gen = None
+            for attempt in range(_BLOCK_RETRIES + 1):
+                try:
+                    snippets, lang, is_gen = fetch_transcript(vid, languages)
+                    consecutive_blocks = 0
+                    break
+                except Exception as e:  # noqa: BLE001
+                    if _is_ip_block(e):
+                        consecutive_blocks += 1
+                        if consecutive_blocks >= _MAX_CONSECUTIVE_BLOCKS:
+                            sys.stderr.write(
+                                "[ingest] YouTube is rate-limiting this IP "
+                                "(%d consecutive blocks). Stopping -- wait ~30-60 "
+                                "min and re-run; incremental resumes.\n"
+                                % consecutive_blocks)
+                            aborted = True
+                            snippets = None
+                            break
+                        if attempt < _BLOCK_RETRIES:
+                            back = _BLOCK_BACKOFF_S * (2 ** attempt)
+                            sys.stderr.write("[ingest] IP block on %s; backoff %ds "
+                                             "(retry %d/%d)\n"
+                                             % (vid, int(back), attempt + 1, _BLOCK_RETRIES))
+                            time.sleep(back)
+                            continue
+                        sys.stderr.write("[ingest] still blocked on %s; skipping\n" % vid)
+                        blocked_skips += 1
+                    else:
+                        sys.stderr.write("[ingest] no transcript for %s: %s\n"
+                                         % (vid, str(e).splitlines()[0][:160]
+                                            or type(e).__name__))
+                        no_transcript += 1
+                    snippets = None
+                    break
+            if aborted:
+                break
+            if snippets is None:
                 continue
+            # Pace successful fetches so we don't trip YouTube's per-IP limiter.
+            if sleep_s > 0:
+                time.sleep(sleep_s)
             fulltext = transcript_fulltext(snippets)
             chash = hashlib.sha256(fulltext.encode("utf-8")).hexdigest()
 
@@ -225,8 +284,13 @@ def ingest(corpus: str, targets: list[str], languages: list[str] | None = None,
                   % (len(videos), total_chunks,
                      est_tokens / 1_000_000.0 * EMBED_PRICE_PER_MTOKEN))
             return 0
-        print("[done] %s: indexed=%d skipped=%d no_transcript=%d chunks=%d"
-              % (corpus, indexed, skipped, no_transcript, total_chunks))
+        print("[done] %s: indexed=%d skipped=%d no_transcript=%d "
+              "ip_blocked=%d chunks=%d%s"
+              % (corpus, indexed, skipped, no_transcript, blocked_skips,
+                 total_chunks, "  [ABORTED: IP rate-limited]" if aborted else ""))
+        if aborted:
+            sys.stderr.write("[ingest] Re-run the same command after a cooldown; "
+                             "indexed videos are skipped automatically.\n")
         return 0
     finally:
         conn.close()

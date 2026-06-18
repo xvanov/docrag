@@ -36,8 +36,8 @@ youtube = ["rag[azure,claude]", "yt-dlp>=2024.0.0", "youtube-transcript-api>=0.6
 all = ["rag[building_codes,youtube,rerank,scrape]"]
 
 [project.scripts]
-# Single multi-domain entry point. Implemented in Step 7 (docrag/cli.py).
-# rag = "docrag.cli:main"
+# Single multi-domain entry point.
+rag = "docrag.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["."]

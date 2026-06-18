@@ -34,16 +34,17 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from . import settings
 from .answer import (
+    CHAT_MAX_TOKENS,
+    CHAT_TEMPERATURE,
     CROSS_JURISDICTION_NOTE,
     MODEL_REFUSAL_SENTENCE,
     _authorities,
     _build_chunks_block,
-    _chat_client,
-    _chat_with_backoff,
     _normalize_quotes,
     _parse_citations,
     _refused,
 )
+from .core.chat import get_chat_provider
 from .query import rag_query
 
 MAX_VERIFY_ROUNDS = 2          # extra hypothesis-directed retrieve+answer rounds
@@ -107,10 +108,10 @@ def _understand(query: str, history: list[dict] | None) -> dict:
     fallback = {"cleaned_query": query, "facts": {}, "hypothesis": "",
                 "rules_to_check": [], "search_queries": []}
     try:
-        client = _chat_client()
+        provider = get_chat_provider("azure")
     except Exception:  # noqa: BLE001 -- no Azure config
         return fallback
-    messages = [{"role": "system", "content": _UNDERSTAND_SYS}]
+    messages = []
     if history:
         for turn in history[-4:]:
             if turn.get("role") in ("user", "assistant") and turn.get("content"):
@@ -119,8 +120,10 @@ def _understand(query: str, history: list[dict] | None) -> dict:
     try:
         # Use the full synthesis model for planning too -- the FAST deployment
         # is less reliable, and plan quality drives the whole pipeline.
-        resp = _chat_with_backoff(client, settings.chat_deployment_synthesis(), messages)
-        raw = (resp.choices[0].message.content or "").strip()
+        result = provider.complete(system=_UNDERSTAND_SYS, messages=messages,
+                                   max_tokens=CHAT_MAX_TOKENS,
+                                   temperature=CHAT_TEMPERATURE)
+        raw = (result.text or "").strip()
     except Exception as e:  # noqa: BLE001
         sys.stderr.write("[reason] understand failed (%s); plain retrieval\n" % e)
         return fallback
@@ -426,14 +429,14 @@ def answer(corpus: str, query: str, history: list[dict] | None = None,
     system_prompt = _VERIFY_SYS + (cross_note if applied_balance else "")
 
     try:
-        client = _chat_client()
+        provider = get_chat_provider("azure")
     except Exception as e:  # noqa: BLE001
         return attach(_refused(chunks, "no_chat_client:%s" % e, "refused"))
     deployment = settings.chat_deployment_synthesis()
 
     while True:
         chunks_block = _build_chunks_block(chunks, query)
-        messages = [{"role": "system", "content": system_prompt}]
+        messages = []
         if history:
             for turn in history:
                 if turn.get("role") in ("user", "assistant") and turn.get("content"):
@@ -441,15 +444,12 @@ def answer(corpus: str, query: str, history: list[dict] | None = None,
         messages.append({"role": "user",
                          "content": _verify_prompt(query, plan, chunks_block)})
         _t = time.monotonic()
-        resp = _chat_with_backoff(client, deployment, messages)
+        result = provider.complete(system=system_prompt, messages=messages,
+                                   max_tokens=CHAT_MAX_TOKENS,
+                                   temperature=CHAT_TEMPERATURE)
         _verify_ms = _ms(_t)
-        try:
-            text = (resp.choices[0].message.content or "").strip()
-        except (AttributeError, IndexError) as e:
-            raise EnvironmentError("chat returned unexpected shape: %s" % e) from e
-        usage = getattr(resp, "usage", None)
-        tokens = {"prompt": getattr(usage, "prompt_tokens", None) if usage else None,
-                  "completion": getattr(usage, "completion_tokens", None) if usage else None}
+        text = (result.text or "").strip()
+        tokens = {"prompt": result.prompt_tokens, "completion": result.completion_tokens}
 
         need = _NEED_RE.match(text)
         stage("verify", round=rounds, dur_ms=_verify_ms, deployment=deployment,

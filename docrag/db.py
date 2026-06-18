@@ -28,6 +28,7 @@ CLI:
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import sqlite3
@@ -43,7 +44,9 @@ import sqlite_vec
 from . import settings
 
 # Bump when the schema changes in a way that requires a full rebuild.
-SCHEMA_VERSION = 2
+#   v3: add domain-agnostic `metadata` JSON column to files+chunks; add
+#       extraction_cache (cached per-doc LLM extractions, e.g. youtube map step).
+SCHEMA_VERSION = 3
 
 # Corpus names map directly to filesystem paths ({index_dir}/{corpus}.db).
 _CORPUS_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
@@ -96,7 +99,9 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
       path TEXT PRIMARY KEY,
       sha256 TEXT NOT NULL,
       size INTEGER NOT NULL,
-      indexed_at INTEGER NOT NULL
+      indexed_at INTEGER NOT NULL,
+      metadata TEXT            -- JSON: per-doc domain metadata (youtube: channel,
+                              -- title, url, upload_date; codes: {} / unused)
     );
 
     CREATE TABLE IF NOT EXISTS chunks (
@@ -120,6 +125,10 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
       edition TEXT,
       parent_section_id TEXT,
       node_type TEXT NOT NULL DEFAULT 'leaf',
+      metadata TEXT,           -- JSON: domain-specific leaf metadata. codes use
+                              -- the explicit columns above; youtube stores
+                              -- {video_id, channel, title, url, start_time,
+                              -- end_time, ...} here.
       FOREIGN KEY(path) REFERENCES files(path) ON DELETE CASCADE
     );
 
@@ -154,6 +163,18 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     );
     CREATE INDEX IF NOT EXISTS idx_section_refs_src  ON section_refs(src_section_id);
     CREATE INDEX IF NOT EXISTS idx_section_refs_path ON section_refs(path);
+
+    CREATE TABLE IF NOT EXISTS extraction_cache (
+      path TEXT NOT NULL,             -- doc id (codes: rel path; youtube: yt:<id>)
+      corpus TEXT NOT NULL,
+      content_hash TEXT NOT NULL,     -- invalidates when the source content changes
+      extraction_kind TEXT NOT NULL,  -- e.g. "predictions" | "claims" | "summary"
+      model TEXT NOT NULL,            -- invalidates if the extracting model changes
+      result TEXT NOT NULL,           -- JSON: the cached per-doc extraction
+      created_at INTEGER NOT NULL,
+      PRIMARY KEY (path, extraction_kind, content_hash, model)
+    );
+    CREATE INDEX IF NOT EXISTS idx_extraction_cache_corpus ON extraction_cache(corpus);
     """)
 
     cur.execute(
@@ -185,12 +206,18 @@ def file_row(conn: sqlite3.Connection, path: str) -> tuple[str, int] | None:
     return (row[0], row[1]) if row else None
 
 
-def upsert_file(conn: sqlite3.Connection, path: str, sha256: str, size: int) -> None:
-    """Insert-or-replace a files row. Does NOT commit."""
+def upsert_file(conn: sqlite3.Connection, path: str, sha256: str, size: int,
+                metadata: dict | None = None) -> None:
+    """Insert-or-replace a files row. Does NOT commit.
+
+    ``metadata`` (optional) is a domain dict stored as JSON -- e.g. youtube's
+    per-video {channel, title, url, upload_date}. Building-codes passes None.
+    """
     conn.execute(
-        "INSERT OR REPLACE INTO files(path, sha256, size, indexed_at) "
-        "VALUES(?, ?, ?, ?)",
-        (path, sha256, int(size), int(time.time())),
+        "INSERT OR REPLACE INTO files(path, sha256, size, indexed_at, metadata) "
+        "VALUES(?, ?, ?, ?, ?)",
+        (path, sha256, int(size), int(time.time()),
+         json.dumps(metadata) if metadata is not None else None),
     )
 
 
@@ -207,6 +234,7 @@ def purge_file(conn: sqlite3.Connection, path: str) -> None:
     cur.execute("DELETE FROM chunks WHERE path=?", (path,))
     cur.execute("DELETE FROM section_nodes WHERE path=?", (path,))
     cur.execute("DELETE FROM section_refs WHERE path=?", (path,))
+    cur.execute("DELETE FROM extraction_cache WHERE path=?", (path,))
     cur.execute("DELETE FROM files WHERE path=?", (path,))
 
 
@@ -236,12 +264,14 @@ def insert_chunks(
                 "embedding dim %d != configured %d for path=%s"
                 % (len(vec), dims, ch.get("path"))
             )
+        meta = ch.get("metadata")
         cur.execute(
             "INSERT INTO chunks(path, corpus, source_file, kind, page, "
             "start_line, end_line, text, context_summary, content_hash, "
             "indexed_at, section_id, section_number, section_title, "
-            "breadcrumb, jurisdiction, edition, parent_section_id, node_type) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "breadcrumb, jurisdiction, edition, parent_section_id, node_type, "
+            "metadata) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 ch["path"], ch["corpus"], ch["source_file"],
                 ch.get("kind", "document"), ch.get("page"),
@@ -252,6 +282,7 @@ def insert_chunks(
                 ch.get("section_title"), ch.get("breadcrumb"),
                 ch.get("jurisdiction"), ch.get("edition"),
                 ch.get("parent_section_id"), ch.get("node_type", "leaf"),
+                json.dumps(meta) if meta is not None else None,
             ),
         )
         chunk_id = cur.lastrowid
@@ -324,6 +355,37 @@ def get_refs(conn: sqlite3.Connection, src_section_id: str) -> list[dict]:
     )
     cols = [d[0] for d in cur.description]
     return [dict(zip(cols, r)) for r in cur.fetchall()]
+
+
+def get_extraction(conn: sqlite3.Connection, path: str, extraction_kind: str,
+                   content_hash: str, model: str) -> dict | None:
+    """Return a cached per-doc extraction (parsed JSON) or None on miss.
+
+    Keyed on content_hash + model so a changed transcript or a model switch is a
+    natural cache miss (no stale results)."""
+    row = conn.execute(
+        "SELECT result FROM extraction_cache WHERE path=? AND extraction_kind=? "
+        "AND content_hash=? AND model=?",
+        (path, extraction_kind, content_hash, model),
+    ).fetchone()
+    if not row:
+        return None
+    try:
+        return json.loads(row[0])
+    except (ValueError, TypeError):
+        return None
+
+
+def put_extraction(conn: sqlite3.Connection, path: str, corpus: str,
+                   content_hash: str, extraction_kind: str, model: str,
+                   result: object) -> None:
+    """Cache a per-doc extraction (JSON-serializable). Does NOT commit."""
+    conn.execute(
+        "INSERT OR REPLACE INTO extraction_cache(path, corpus, content_hash, "
+        "extraction_kind, model, result, created_at) VALUES(?,?,?,?,?,?,?)",
+        (path, corpus, content_hash, extraction_kind, model,
+         json.dumps(result), int(time.time())),
+    )
 
 
 def stats(conn: sqlite3.Connection, corpus: str) -> dict:
@@ -403,7 +465,8 @@ def _self_test() -> int:
              "section_id": "Sec101.2", "section_number": "101.2",
              "section_title": "Scope", "breadcrumb": "Ch1 > 101 > 101.2",
              "jurisdiction": "north-carolina", "edition": "NC 2024",
-             "parent_section_id": "Sec101", "node_type": "leaf"},
+             "parent_section_id": "Sec101", "node_type": "leaf",
+             "metadata": {"start_time": 12.5, "channel": "selftest"}},
         ]
         embs = [[rng.uniform(-1, 1) for _ in range(dims)] for _ in chunk_dicts]
         ids = insert_chunks(conn, chunk_dicts, embs)
@@ -430,6 +493,21 @@ def _self_test() -> int:
         refs = get_refs(conn, "Sec101.2")
         assert refs and refs[0]["dst_raw"] == "160D-1110", refs
 
+        # metadata JSON round-trips on the chunk row.
+        meta_row = conn.execute(
+            "SELECT metadata FROM chunks WHERE content_hash='h2'").fetchone()
+        assert meta_row and json.loads(meta_row[0])["start_time"] == 12.5, meta_row
+
+        # extraction_cache: miss -> put -> hit; model/hash mismatch -> miss.
+        assert get_extraction(conn, "doc.html", "summary", "h2", "m1") is None
+        put_extraction(conn, "doc.html", corpus, "h2", "summary", "m1",
+                       {"points": ["a", "b"]})
+        conn.commit()
+        got = get_extraction(conn, "doc.html", "summary", "h2", "m1")
+        assert got == {"points": ["a", "b"]}, got
+        assert get_extraction(conn, "doc.html", "summary", "h2", "m2") is None
+        assert get_extraction(conn, "doc.html", "summary", "OTHER", "m1") is None
+
         probe = _pack_vec(embs[0])
         vec_rows = conn.execute(
             "SELECT chunk_id FROM vec_chunks WHERE embedding MATCH ? "
@@ -454,6 +532,8 @@ def _self_test() -> int:
         for k in ("file_count", "chunk_count", "vec_count", "fts_count",
                   "section_count", "ref_count"):
             assert s2[k] == 0, (k, s2[k])
+        ec = conn.execute("SELECT COUNT(*) FROM extraction_cache").fetchone()[0]
+        assert ec == 0, ("extraction_cache not purged", ec)
     finally:
         conn.close()
         for suffix in ("", "-wal", "-shm", "-journal"):

@@ -16,10 +16,8 @@ Public API:
 from __future__ import annotations
 
 import re
-import sys
-import time
 
-from . import settings
+from .core.chat import get_chat_provider
 from .query import rag_query
 
 
@@ -27,9 +25,6 @@ CHUNK_CHAR_BUDGET = 4500          # per-section cap (parents are richer now)
 TOTAL_CONTEXT_BUDGET = 48000      # overall cap; later chunks get tightened
 CHAT_TEMPERATURE = 0.2
 CHAT_MAX_TOKENS = 900
-MAX_ATTEMPTS = 6
-INITIAL_DELAY_S = 1.0
-MAX_DELAY_S = 60.0
 
 MODEL_REFUSAL_SENTENCE = "I don't have documentation for that."
 
@@ -327,74 +322,6 @@ def _parse_citations(answer_text: str, n_chunks: int) -> list[int]:
     return sorted(found)
 
 
-def _chat_client():
-    from openai import AzureOpenAI  # type: ignore
-
-    endpoint = settings.azure_endpoint()
-    api_key = settings.azure_api_key()
-    if not endpoint or not api_key:
-        raise EnvironmentError(
-            "AZURE_OPENAI_ENDPOINT and AZURE_OPENAI_API_KEY must be set."
-        )
-    # Bound every chat call: the SDK default 600s timeout (+ retries) means a
-    # single stalled request can freeze a query / MCP tool call for 10-30 min.
-    # Our own _chat_with_backoff handles transient retries, so cap hard here.
-    # Override via DOCRAG_HTTP_TIMEOUT.
-    return AzureOpenAI(
-        azure_endpoint=endpoint,
-        api_key=api_key,
-        api_version=settings.azure_api_version(),
-        timeout=float(settings.get("DOCRAG_HTTP_TIMEOUT", 60) or 60),
-        max_retries=2,
-    )
-
-
-def _chat_with_backoff(client, deployment: str, messages: list[dict]):
-    """chat.completions with backoff + token/temperature param probing."""
-    use_max_tokens_legacy = False
-    send_temperature = True
-    delay = INITIAL_DELAY_S
-    for attempt in range(MAX_ATTEMPTS):
-        kwargs: dict = {"model": deployment, "messages": messages}
-        if send_temperature:
-            kwargs["temperature"] = CHAT_TEMPERATURE
-        if use_max_tokens_legacy:
-            kwargs["max_tokens"] = CHAT_MAX_TOKENS
-        else:
-            kwargs["max_completion_tokens"] = CHAT_MAX_TOKENS
-        try:
-            t0 = time.monotonic()
-            resp = client.chat.completions.create(**kwargs)
-            sys.stderr.write(
-                "[answer] chat ok deployment=%s in %dms\n"
-                % (deployment, int((time.monotonic() - t0) * 1000))
-            )
-            return resp
-        except Exception as e:  # noqa: BLE001
-            msg = str(e)
-            lower = msg.lower()
-            transient = ("429" in msg or "rate" in lower or "throttle" in lower
-                         or any(c in msg for c in (" 500", " 502", " 503", " 504"))
-                         or "server_error" in lower or "overloaded" in lower)
-            if transient:
-                time.sleep(delay)
-                delay = min(delay * 2, MAX_DELAY_S)
-                continue
-            if ("max_completion_tokens" in lower and "not supported" in lower
-                    and not use_max_tokens_legacy):
-                use_max_tokens_legacy = True
-                continue
-            if ("temperature" in lower
-                    and ("not supported" in lower or "unsupported" in lower)
-                    and send_temperature):
-                send_temperature = False
-                continue
-            raise EnvironmentError("Azure OpenAI chat failed: %s" % msg) from e
-    raise EnvironmentError(
-        "Azure OpenAI chat failed after %d retries (rate-limited)." % MAX_ATTEMPTS
-    )
-
-
 def _refused(chunks, reason, status):
     return {"answer": None, "citations": [], "chunks": chunks,
             "refused": True, "refusal_reason": reason, "status": status,
@@ -445,20 +372,12 @@ def answer(corpus: str, query: str, history: list[dict] | None = None,
                 messages.append({"role": role, "content": content})
     messages.append({"role": "user", "content": user_prompt})
 
-    client = _chat_client()
-    deployment = settings.chat_deployment_synthesis()
-    resp = _chat_with_backoff(client, deployment, messages)
-
-    try:
-        answer_text = (resp.choices[0].message.content or "").strip()
-    except (AttributeError, IndexError) as e:
-        raise EnvironmentError("Azure chat returned unexpected shape: %s" % e) from e
-
-    usage = getattr(resp, "usage", None)
-    tokens = {
-        "prompt": getattr(usage, "prompt_tokens", None) if usage else None,
-        "completion": getattr(usage, "completion_tokens", None) if usage else None,
-    }
+    provider = get_chat_provider("azure")
+    result = provider.complete(system=system_prompt, messages=messages[1:],
+                               max_tokens=CHAT_MAX_TOKENS,
+                               temperature=CHAT_TEMPERATURE)
+    answer_text = result.text
+    tokens = {"prompt": result.prompt_tokens, "completion": result.completion_tokens}
 
     if MODEL_REFUSAL_SENTENCE in _normalize_quotes(answer_text):
         out = _refused(chunks, "model_refused_insufficient_context", "refused")

@@ -1,7 +1,7 @@
 {
   "mcpServers": {
     "docrag": {
-      "command": "C:\\repos\\docrag\\.venv\\Scripts\\python.exe",
+      "command": "/home/k/docrag/.venv/bin/python",
       "args": ["-m", "docrag.mcp_server"]
     }
   }

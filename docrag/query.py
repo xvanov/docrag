@@ -248,12 +248,17 @@ def _fuse_one(conn, qtext: str, vlim: int, blim: int) -> dict[int, float]:
 
 def rag_query(corpus: str, query: str, top_k: int = 8,
               filters: dict | None = None, balance: bool = False,
-              expand: bool = True) -> dict:
+              expand: bool = True, short_code_filter: bool = True) -> dict:
     """Hybrid retrieve + rerank + parent-collapse top_k sections for ``query``.
 
     ``expand`` controls the built-in LLM query expansion. The agentic layer
     (reason.py) does its own hypothesis-directed expansion, so it calls with
     ``expand=False`` to avoid a redundant paraphrase round.
+
+    ``short_code_filter`` is the building-codes section-number hard-filter (a
+    token like "R705" must appear in results). Domains without section numbers
+    (e.g. youtube transcripts) pass ``False`` so tokens like "5G"/"Q4" don't
+    wrongly empty the pool.
     """
     query = (query or "").strip()
     if not query:
@@ -327,7 +332,7 @@ def rag_query(corpus: str, query: str, top_k: int = 8,
                 kept.append(r)
             leaves = kept
 
-        codes = _short_codes(query)
+        codes = _short_codes(query) if short_code_filter else []
         if codes:
             pats = [re.compile(r"\b%s\b" % re.escape(c)) for c in codes]
             kept = [r for r in leaves if any(p.search(r.get("text") or "") for p in pats)]

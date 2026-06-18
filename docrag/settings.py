@@ -67,6 +67,15 @@ def get(key: str, default: Any = None) -> Any:
     return default
 
 
+def corpus_config(corpus: str) -> dict:
+    """Per-corpus config block from app.settings.json, e.g.
+    ``{"corpora": {"zeihan": {"domain": "youtube", "chat": {...}}}}``.
+    Returns {} when absent."""
+    corpora = _settings().get("corpora") or {}
+    cfg = corpora.get((corpus or "").strip().lower())
+    return cfg if isinstance(cfg, dict) else {}
+
+
 # ---------- Paths ----------
 
 def repo_root() -> str:

@@ -1,5 +1,11 @@
 # Working in this repo as a research agent
 
+> **Repo is now multi-domain.** `docrag` is a general hybrid-search RAG core
+> (`docrag/core/`) with pluggable domains (`docrag/domains/`): **building_codes**
+> (this doc) and **youtube** (transcript Q&A, answered by Claude — see README).
+> Use the `rag` CLI (`rag ask/index --domain ... --corpus ...`) or the per-domain
+> MCP servers in `.mcp.json`. The notes below describe the building-codes domain.
+
 This repo (`docrag`) is a grounded document-RAG over building regulations. The
 intended way to use it is **agentic**: you (the Claude session) take a question,
 decide what to do, query the docrag corpus to ground claims, search the web for

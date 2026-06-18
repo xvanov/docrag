@@ -34,7 +34,7 @@ Usage:
   python scraper/scrape_ncosfm.py --type interpretations --limit 1   # validation
   python scraper/scrape_ncosfm.py --type appeals --force             # re-extract
 Then:
-  python -m docrag.index build --corpus building-codes --confirm
+  python -m rag.index build --corpus building-codes --confirm
 
 Authorized personal/local use of public records; do not redistribute the corpus.
 """
@@ -49,9 +49,10 @@ import time
 import urllib.request
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if ROOT not in sys.path:
-    sys.path.insert(0, ROOT)
-from docrag.extractors import extract_pdf_pages, sanitize_ascii  # noqa: E402
+SRC = os.path.join(ROOT, "src")  # src-layout: the package lives at <repo>/src/rag
+if SRC not in sys.path:
+    sys.path.insert(0, SRC)
+from rag.extractors import extract_pdf_pages, sanitize_ascii  # noqa: E402
 
 BASE = "https://www.ncosfm.gov"
 OUT_ROOT = os.path.join(ROOT, "corpora", "building-codes", "nc-interpretations")

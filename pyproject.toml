@@ -37,8 +37,8 @@ all = ["rag[building_codes,youtube,rerank,scrape]"]
 
 [project.scripts]
 # Single multi-domain entry point.
-rag = "docrag.cli:main"
+rag = "rag.cli:main"
 
 [tool.setuptools.packages.find]
-where = ["."]
-include = ["docrag*"]
+where = ["src"]
+include = ["rag*"]

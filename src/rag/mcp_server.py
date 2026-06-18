@@ -12,7 +12,7 @@ calls docrag to ground building-code claims, web-searches for precedent, and
 reconciles -- exactly the ask -> retrieve -> validate loop.
 
 Run (stdio):
-    python -m docrag.mcp_server
+    python -m rag.mcp_server
 
 Register in Claude Code via .mcp.json at the repo root (already provided), or:
     claude mcp add docrag -- <python> -m docrag.mcp_server
@@ -69,7 +69,7 @@ from .query import rag_query               # noqa: E402
 from .answer import answer as _answer_fast    # noqa: E402  single-pass synthesis
 from .reason import answer as _answer_deep    # noqa: E402  agentic hypothesize->verify
 
-mcp = FastMCP("docrag")
+mcp = FastMCP("rag-building-codes")
 
 # Corpora answered with jurisdiction-balanced + agentic (hypothesize-verify)
 # retrieval, matching the web UI / docrag.ask defaults.

@@ -17,8 +17,28 @@ from typing import Any, Optional
 
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
-# docrag/settings.py -> docrag/ -> <repo root>
-_REPO_ROOT = os.path.dirname(_THIS_DIR)
+
+
+def _find_repo_root(start: str) -> str:
+    """Walk up to the dir containing pyproject.toml (or .git). Under the
+    src-layout the package lives at <repo>/src/rag/, so the old "parent of the
+    package dir" heuristic would wrongly point at <repo>/src/ and lose the
+    existing .env / app.settings.json / .index / corpora. Anchor on the project
+    marker instead. (DOCRAG_INDEX_DIR / DOCRAG_DOCS_ROOT still override paths.)"""
+    d = start
+    for _ in range(6):
+        if os.path.isfile(os.path.join(d, "pyproject.toml")) or \
+                os.path.isdir(os.path.join(d, ".git")):
+            return d
+        parent = os.path.dirname(d)
+        if parent == d:
+            break
+        d = parent
+    return os.path.dirname(os.path.dirname(start))  # <repo>/src/rag -> <repo>
+
+
+# <repo>/src/rag/settings.py -> <repo>
+_REPO_ROOT = _find_repo_root(_THIS_DIR)
 
 _ENV_PATH = os.path.join(_REPO_ROOT, ".env")
 _SETTINGS_PATH = os.path.join(_REPO_ROOT, "app.settings.json")

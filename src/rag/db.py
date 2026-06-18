@@ -22,7 +22,7 @@ One DB file per corpus: ``{index_dir}/{corpus}.db``.
 The only module that talks to SQLite.
 
 CLI:
-  python -m docrag.db --self-test
+  python -m rag.db --self-test
 """
 
 from __future__ import annotations
@@ -549,7 +549,7 @@ def _self_test() -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    p = argparse.ArgumentParser(prog="docrag.db")
+    p = argparse.ArgumentParser(prog="rag.db")
     p.add_argument("--self-test", action="store_true")
     args = p.parse_args(list(sys.argv[1:] if argv is None else argv))
     if args.self_test:

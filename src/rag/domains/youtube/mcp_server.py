@@ -7,7 +7,7 @@ stderr), and the answer stack (which pulls the Anthropic SDK) is imported
 EAGERLY in the main thread at module load -- never lazily inside a worker thread,
 which would deadlock CPython's import lock against the event loop.
 
-Run (stdio):  python -m docrag.domains.youtube.mcp_server
+Run (stdio):  python -m rag.domains.youtube.mcp_server
 """
 
 from __future__ import annotations

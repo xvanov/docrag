@@ -2,11 +2,11 @@
   "mcpServers": {
     "rag-building-codes": {
       "command": "/home/k/docrag/.venv/bin/python",
-      "args": ["-m", "docrag.mcp_server"]
+      "args": ["-m", "rag.mcp_server"]
     },
     "rag-youtube": {
       "command": "/home/k/docrag/.venv/bin/python",
-      "args": ["-m", "docrag.domains.youtube.mcp_server"]
+      "args": ["-m", "rag.domains.youtube.mcp_server"]
     }
   }
 }

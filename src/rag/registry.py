@@ -16,8 +16,8 @@ from .domains.base import Domain
 
 # Domain name -> import path of a module exposing a module-level ``DOMAIN``.
 _DOMAIN_MODULES = {
-    "building_codes": "docrag.domains.building_codes",
-    "youtube": "docrag.domains.youtube",
+    "building_codes": "rag.domains.building_codes",
+    "youtube": "rag.domains.youtube",
 }
 
 # Known corpus -> domain, for corpora not listed in app.settings.json.

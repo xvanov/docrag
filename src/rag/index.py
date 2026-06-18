@@ -4,10 +4,10 @@ Wires extract -> chunk -> embed -> upsert into the per-corpus SQLite-vec DB.
 Incremental: files whose SHA256 matches the prior index are skipped.
 
 CLI:
-  python -m docrag.index build  --corpus udo [--full] [--limit N]
+  python -m rag.index build  --corpus udo [--full] [--limit N]
                                  [--confirm] [--dry-run]
-  python -m docrag.index status --corpus udo
-  python -m docrag.index purge  --corpus udo --file <relpath>
+  python -m rag.index status --corpus udo
+  python -m rag.index purge  --corpus udo --file <relpath>
 
 Exit codes:
   0 success | 1 config/IO error | 2 bad usage
@@ -380,7 +380,7 @@ def _do_purge(args) -> int:
 
 
 def _parse_args(argv: Optional[list]) -> argparse.Namespace:
-    p = argparse.ArgumentParser(prog="docrag.index",
+    p = argparse.ArgumentParser(prog="rag.index",
                                 description="Build / inspect / purge a corpus index.")
     sub = p.add_subparsers(dest="cmd", required=True)
 

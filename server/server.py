@@ -49,18 +49,18 @@ import time
 import traceback
 import urllib.parse
 
-from docrag import settings
-from docrag import facets
-from docrag.answer import answer as rag_answer_call
-from docrag.reason import answer as agentic_answer_call
-from docrag import settings as _settings
-from docrag.query import rag_query
+from rag import settings
+from rag import facets
+from rag.answer import answer as rag_answer_call
+from rag.reason import answer as agentic_answer_call
+from rag import settings as _settings
+from rag.query import rag_query
 
 
 def _agentic_enabled() -> bool:
     val = (_settings.get("DOCRAG_AGENTIC", "1") or "1").strip().lower()
     return val not in ("0", "false", "no", "off")
-from docrag.db import open_db, valid_corpus
+from rag.db import open_db, valid_corpus
 
 
 DEFAULT_PORT = 8099
@@ -165,7 +165,7 @@ def _corpus_sources(corpus: str) -> list:
         ).fetchall()
     finally:
         conn.close()
-    from docrag.answer import _authority_tier
+    from rag.answer import _authority_tier
     _TIER_LABEL = {
         "STATE": "NC state law & code", "LOCAL": "Durham ordinance (UDO)",
         "LOCAL-GUIDANCE": "Durham agency guidance (durhamnc.gov)",
@@ -325,7 +325,7 @@ def _save_and_reindex(corpus, filename, body_bytes):
     with open(file_path, "wb") as f:
         f.write(body_bytes)
 
-    cmd = [sys.executable, "-m", "docrag.index", "build",
+    cmd = [sys.executable, "-m", "rag.index", "build",
            "--corpus", corpus, "--confirm"]
     sys.stderr.write("[chat] /api/upload running indexer: %s\n" % " ".join(cmd))
     proc = subprocess.run(cmd, capture_output=True, text=True,

@@ -1,18 +1,68 @@
 # docrag
 
-A generalized document RAG: drop PDFs / DOCX / TXT / MD into a **corpus**,
-index them, and chat with grounded, cited answers.
+A general-purpose grounded **hybrid-search RAG core** with pluggable use-case
+**domains**. The retrieval/embedding/rerank/storage/MCP infrastructure is shared;
+each domain plugs in its own ingest, prompts, chat backend, and citation
+rendering. Two domains ship today:
 
-A standalone fork of the Microvellum knowledge-RAG pipeline with all
-brand / code-tier / manifest machinery removed. The unit of partition is a
-*corpus* -- a named set of documents at `{docs_root}/{corpus}/` indexed into
-`{index_dir}/{corpus}.db`.
+- **building_codes** -- the original use case: PDFs/DOCX/HTML of building codes,
+  statutes, and ordinances, with jurisdiction-balanced retrieval and an agentic
+  hypothesize->verify answer path (Azure OpenAI).
+- **youtube** -- transcript Q&A over videos / channels: pull timestamped
+  transcripts (yt-dlp + youtube-transcript-api), ask focused questions (hybrid
+  retrieval) or **exhaustive** "list ALL X across every video" questions
+  (map-reduce, with cached per-video extractions), answered by **Claude** with
+  `mm:ss` deep-link citations.
+
+The unit of partition is a *corpus* -- a named set of sources indexed into
+`{index_dir}/{corpus}.db`. A corpus's domain is resolved from `app.settings.json`
+(`corpora.<name>.domain`), known names, or an explicit `--domain`.
 
 Retrieval is hybrid: vector similarity (Azure OpenAI `text-embedding-3-large`)
-fused with SQLite FTS5 BM25 via Reciprocal Rank Fusion. A short-uppercase-code
-word-boundary filter and a low-confidence gate suppress hallucination on
-out-of-corpus queries; the LLM is instructed to answer only from retrieved
-chunks and to cite every claim with `[N]`.
+fused with SQLite FTS5 BM25 via Reciprocal Rank Fusion, optional cross-encoder
+rerank, and parent-document collapse. Building-code specifics (jurisdiction
+balancing, lay->code query expansion, the short-code section-number filter) are
+gated off for plain domains like youtube. The LLM answers only from retrieved
+context and cites every claim with `[N]`.
+
+## Architecture
+
+```
+docrag/
+  core/         source-agnostic infra: chat.py (Azure/Claude provider seam),
+                orchestrate.py (strategy dispatch). db/embed/query/rerank shared.
+  domains/
+    base.py           the Domain plugin interface
+    building_codes/   thin adapter over index/answer/reason/facets (Azure)
+    youtube/          ingest, chunker (timestamps), prompts, answer, mapreduce (Claude)
+  registry.py   corpus/name -> Domain
+  cli.py        the `rag` entry point
+```
+
+The per-corpus SQLite schema carries a domain-agnostic `metadata` JSON column
+(youtube: video_id/url/start_time; codes: explicit columns) plus an
+`extraction_cache` table for cached map-reduce extractions.
+
+## The `rag` CLI
+
+```bash
+rag domains                                            # list domains
+# YouTube (run locally on a residential IP -- cloud IPs are blocked by YouTube)
+rag index --domain youtube --corpus zeihan https://www.youtube.com/@ZeihanonGeopolitics/videos
+rag index --domain youtube --corpus zeihan https://youtu.be/VIDEOID   # add one video
+rag ask   --domain youtube --corpus zeihan "what does he say about demographics?"
+rag ask   --domain youtube --corpus zeihan --exhaustive "list all his predictions"
+rag ask   --domain youtube --corpus zeihan --longctx "summarize his thesis on China"
+rag status --corpus zeihan
+# Building codes (unchanged behavior)
+rag index --corpus building-codes --confirm
+rag ask   --corpus building-codes --location durham-nc "minimum stair riser height?"
+```
+
+YouTube uses Azure embeddings (shared) + Claude for answers, so set both the
+`AZURE_OPENAI_*` keys (embeddings) and `ANTHROPIC_API_KEY` (answers). Install
+only what a domain needs: `pip install -e .[youtube]` (no torch/docling) or
+`pip install -e .[building_codes]`.
 
 ## Setup
 

@@ -16,7 +16,7 @@ authority (any token), and ``expect_answer`` checks the conclusion (all tokens)
 -- so the system must find, reason to, and cite the correct statute on its own.
 
 CLI:
-  python -m docrag.eval --corpus building-codes [--top-k 8]
+  python -m rag.eval --corpus building-codes [--top-k 8]
                         [--no-answer] [--balance|--no-balance]
 """
 
@@ -164,7 +164,7 @@ def run(corpus: str, top_k: int, do_answer: bool, balance: bool,
 
 
 def main(argv=None) -> int:
-    p = argparse.ArgumentParser(prog="docrag.eval")
+    p = argparse.ArgumentParser(prog="rag.eval")
     p.add_argument("--corpus", required=True)
     p.add_argument("--top-k", type=int, default=15)  # match the balanced server path
     p.add_argument("--no-answer", action="store_true",

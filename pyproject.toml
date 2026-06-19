@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rag"
+version = "2.0.0.dev0"
+description = "General-purpose grounded hybrid-search RAG core with pluggable domains (building-codes, youtube)"
+requires-python = ">=3.10"
+# BASE: the shared retrieval core. Intentionally light — no torch, no docling,
+# no playwright, no vendor SDKs. Domains pull their own backends via extras.
+dependencies = [
+  "mcp>=1.2.0",
+  "sqlite-vec>=0.1.6",
+  "python-dotenv>=1.0.0",
+]
+
+[project.optional-dependencies]
+# --- LLM / embedding backends ---
+azure  = ["openai>=1.40.0"]                                  # Azure OpenAI embeddings + chat
+claude = ["anthropic>=0.40.0"]                               # Claude chat (youtube answer LLM)
+
+# --- Capability extras (mix in only what a domain needs) ---
+rerank = ["FlagEmbedding>=1.2.0", "transformers>=4.40,<5"]   # cross-encoder; pulls torch
+pdf    = ["docling>=2.0.0", "PyPDF2>=3.0.0", "pycryptodome>=3.20.0",
+          "PyMuPDF>=1.24.0", "python-docx>=1.1.0"]
+html   = ["beautifulsoup4>=4.12.0", "lxml>=5.0.0"]
+scrape = ["playwright>=1.40.0"]                              # ICC scraper only
+
+# --- Domain bundles (what a user actually installs) ---
+# building-codes: Azure embeddings+chat, PDF + HTML extraction. Add [rerank]/[scrape] explicitly.
+building_codes = ["rag[azure,pdf,html]"]
+# youtube: Azure embeddings (shared), Claude answers, transcript ingest. No torch/docling/playwright.
+youtube = ["rag[azure,claude]", "yt-dlp>=2024.0.0", "youtube-transcript-api>=0.6.0"]
+
+all = ["rag[building_codes,youtube,rerank,scrape]"]
+
+[project.scripts]
+# Single multi-domain entry point.
+rag = "rag.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["rag*"]

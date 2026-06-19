@@ -22,6 +22,7 @@ Public API:
 from __future__ import annotations
 
 import fnmatch
+import json
 import re
 import struct
 
@@ -44,20 +45,14 @@ LOW_CONFIDENCE_RERANK = 0.02
 MAX_REF_EXPANSION = 3     # extra cross-referenced sections per query
 _REF_SCORE = -1.0         # sentinel: expansion sections sort last, ignore in stats
 
-# A "short code" is an explicit provision/section/table identifier the user
-# typed (e.g. R705, 160D, E3902) that we then REQUIRE in the results to suppress
-# hallucination. It must mix a LETTER and a DIGIT: pure-alpha uppercase tokens
-# ("NC", "IBC", "ADA") are abbreviations and pure-digit tokens ("20", "000" from
-# "$20,000") are quantities -- neither is a section number, and hard-filtering
-# on them wrongly empties the candidate pool (e.g. dropping R101.2.1 for a query
-# that merely says "in Durham, NC" or "$20,000").
-_SHORT_CODE_RE = re.compile(r"^(?=[A-Z0-9]{2,8}$)(?=.*[A-Z])(?=.*\d)[A-Z0-9]+$")
 _FTS_SYNTAX_RE = re.compile(r'[\"\(\)\*\:\^]')
 
-# Jurisdiction buckets for the building-codes corpus (model / state / local).
-_JURISDICTIONS = (("north-carolina/", "north-carolina"), ("model/", "model"),
-                  ("durham/", "durham"))
-_DOMINANCE_FRAC = 0.6
+# Building-codes-specific retrieval helpers (jurisdiction bucketing/balancing,
+# the short-code section-number filter, lay->code query expansion) live in the
+# building_codes domain (domains/building_codes/retrieval.py) and are
+# lazy-imported only inside the branches below that the caller opts into
+# (balance / short_code_filter / expand) -- so a plain domain like youtube never
+# imports them and the core retrieval skeleton stays generic.
 
 
 def _pack_vec(vec) -> bytes:
@@ -73,27 +68,13 @@ def _fts_query(raw: str) -> str:
     return " OR ".join('"%s"' % t.replace('"', "") for t in tokens)
 
 
-def _short_codes(query: str) -> list[str]:
-    out = []
-    for tok in re.split(r"[\s,;:()\[\]{}/]+", query or ""):
-        tok = tok.strip(".-'\"")
-        if tok and _SHORT_CODE_RE.match(tok):
-            out.append(tok)
-    return out
-
-
-def _jurisdiction_of(row: dict) -> str:
-    j = row.get("jurisdiction")
-    if j:
-        return j
-    p = (row.get("path") or "").replace("\\", "/").lstrip("/")
-    for prefix, name in _JURISDICTIONS:
-        if p.startswith(prefix):
-            return name
-    return p.split("/", 1)[0] if "/" in p else "_root"
-
-
 def _row_to_result(row: dict, score: float, text: str, referenced: bool = False) -> dict:
+    meta = row.get("metadata")
+    if isinstance(meta, str):
+        try:
+            meta = json.loads(meta)
+        except (ValueError, TypeError):
+            meta = None
     return {
         "chunk_id": row.get("id"),
         "path": row.get("path"),
@@ -108,118 +89,16 @@ def _row_to_result(row: dict, score: float, text: str, referenced: bool = False)
         "breadcrumb": row.get("breadcrumb"),
         "jurisdiction": row.get("jurisdiction"),
         "edition": row.get("edition"),
+        "metadata": meta,            # domain-specific (youtube: start_time/url/...)
         "text": text,
         "score": score,
         "referenced": referenced,
     }
 
 
-def _balance_dominated(results: list[dict], window: int, frac: float = _DOMINANCE_FRAC) -> bool:
-    top = results[:window]
-    if not top:
-        return True
-    counts: dict[str, int] = {}
-    for r in top:
-        counts[_jurisdiction_of(r)] = counts.get(_jurisdiction_of(r), 0) + 1
-    if len(counts) <= 1:
-        return True
-    return max(counts.values()) / len(top) >= frac
-
-
-def _balance_by_jurisdiction(results: list[dict], top_k: int) -> list[dict]:
-    buckets: dict[str, list[dict]] = {}
-    for r in results:
-        buckets.setdefault(_jurisdiction_of(r), []).append(r)
-    if len(buckets) <= 1:
-        return results[:top_k]
-    order = sorted(buckets, key=lambda k: results.index(buckets[k][0]))
-    out: list[dict] = []
-    i = 0
-    while len(out) < top_k and any(buckets[k] for k in order):
-        b = buckets[order[i % len(order)]]
-        if b:
-            out.append(b.pop(0))
-        i += 1
-    return out
-
-
-def _stratified_pool(leaves: list[dict], cap: int) -> list[dict]:
-    """Round-robin the RRF-ordered leaves across jurisdictions up to ``cap`` so
-    every jurisdiction's best candidates reach the reranker (preventing one
-    jurisdiction from flooding the pool). Order within a jurisdiction is the
-    RRF order; the reranker re-scores the whole pool afterward."""
-    buckets: dict[str, list[dict]] = {}
-    for lf in leaves:
-        buckets.setdefault(_jurisdiction_of(lf), []).append(lf)
-    if len(buckets) <= 1:
-        return leaves[:cap]
-    order = sorted(buckets, key=lambda k: leaves.index(buckets[k][0]))
-    out: list[dict] = []
-    i = 0
-    while len(out) < cap and any(buckets[k] for k in order):
-        b = buckets[order[i % len(order)]]
-        if b:
-            out.append(b.pop(0))
-        i += 1
-    return out
-
-
 def _expand_refs_enabled() -> bool:
     val = (settings.get("DOCRAG_EXPAND_REFS", "1") or "1").strip().lower()
     return val not in ("0", "false", "no", "off")
-
-
-def _expand_query_enabled() -> bool:
-    val = (settings.get("DOCRAG_EXPAND_QUERY", "1") or "1").strip().lower()
-    return val not in ("0", "false", "no", "off")
-
-
-_EXPAND_N = 3
-_EXPAND_SYS = (
-    "You rewrite a user's question into alternative search queries that use the "
-    "formal terminology found in building codes, statutes, and zoning "
-    "ordinances. A code rarely uses lay words: a 'shed' is a 'detached "
-    "accessory structure/building'; 'do I need a permit' maps to 'permit "
-    "exemption / work not requiring a permit / when a permit is required'; "
-    "'cost' maps to thresholds. Output exactly %d concise alternative queries, "
-    "one per line, no numbering, no commentary -- each a different phrasing or "
-    "the technical class names a code would use for the subject."
-) % _EXPAND_N
-
-
-def _expand_queries(query: str) -> list[str]:
-    """LLM paraphrases of the question into code-vocabulary search queries.
-
-    Bridges the lay-vs-code vocabulary gap so a rule phrased as a scope/exemption
-    (e.g. R101.2.1 'Accessory buildings') is recalled even when the user says
-    'shed'. Returns [] on any failure / when disabled -- retrieval then proceeds
-    on the original query alone (graceful degradation). Generic: no per-question
-    rules, the model generates the alternatives."""
-    if not _expand_query_enabled() or not query:
-        return []
-    try:
-        from openai import AzureOpenAI  # type: ignore
-        endpoint = settings.azure_endpoint()
-        api_key = settings.azure_api_key()
-        if not endpoint or not api_key:
-            return []
-        client = AzureOpenAI(azure_endpoint=endpoint, api_key=api_key,
-                             api_version=settings.azure_api_version())
-        resp = client.chat.completions.create(
-            model=settings.chat_deployment_synthesis(),
-            messages=[{"role": "system", "content": _EXPAND_SYS},
-                      {"role": "user", "content": query}],
-            max_completion_tokens=160,
-        )
-        text = (resp.choices[0].message.content or "").strip()
-    except Exception:  # noqa: BLE001 -- any LLM/transport failure -> no expansion
-        return []
-    out = []
-    for ln in text.splitlines():
-        ln = ln.strip().lstrip("0123456789.)-* \t").strip()
-        if ln and ln.lower() != query.lower():
-            out.append(ln)
-    return out[:_EXPAND_N]
 
 
 def _fuse_one(conn, qtext: str, vlim: int, blim: int) -> dict[int, float]:
@@ -248,12 +127,17 @@ def _fuse_one(conn, qtext: str, vlim: int, blim: int) -> dict[int, float]:
 
 def rag_query(corpus: str, query: str, top_k: int = 8,
               filters: dict | None = None, balance: bool = False,
-              expand: bool = True) -> dict:
+              expand: bool = True, short_code_filter: bool = True) -> dict:
     """Hybrid retrieve + rerank + parent-collapse top_k sections for ``query``.
 
     ``expand`` controls the built-in LLM query expansion. The agentic layer
     (reason.py) does its own hypothesis-directed expansion, so it calls with
     ``expand=False`` to avoid a redundant paraphrase round.
+
+    ``short_code_filter`` is the building-codes section-number hard-filter (a
+    token like "R705" must appear in results). Domains without section numbers
+    (e.g. youtube transcripts) pass ``False`` so tokens like "5G"/"Q4" don't
+    wrongly empty the pool.
     """
     query = (query or "").strip()
     if not query:
@@ -273,7 +157,11 @@ def rag_query(corpus: str, query: str, top_k: int = 8,
         # building") so scope/exemption rules are recalled regardless of how
         # the user phrases the question. Each query contributes vector+BM25 RRF;
         # scores are summed (RRF over all query x retriever rankings).
-        queries = [query] + (_expand_queries(query) if expand else [])
+        if expand:
+            from .domains.building_codes.retrieval import _expand_queries
+            queries = [query] + _expand_queries(query)
+        else:
+            queries = [query]
         fused: dict[int, float] = {}
         for qtext in queries:
             for cid, score in _fuse_one(conn, qtext, vlim, blim).items():
@@ -288,7 +176,7 @@ def rag_query(corpus: str, query: str, top_k: int = 8,
         cur = conn.execute(
             "SELECT id, path, corpus, source_file, kind, page, start_line, "
             "end_line, text, section_id, section_number, section_title, "
-            "breadcrumb, jurisdiction, edition, node_type "
+            "breadcrumb, jurisdiction, edition, node_type, metadata "
             "FROM chunks WHERE id IN (%s)" % ph, ordered_ids,
         )
         cols = [d[0] for d in cur.description]
@@ -327,7 +215,11 @@ def rag_query(corpus: str, query: str, top_k: int = 8,
                 kept.append(r)
             leaves = kept
 
-        codes = _short_codes(query)
+        if short_code_filter:
+            from .domains.building_codes.retrieval import _short_codes
+            codes = _short_codes(query)
+        else:
+            codes = []
         if codes:
             pats = [re.compile(r"\b%s\b" % re.escape(c)) for c in codes]
             kept = [r for r in leaves if any(p.search(r.get("text") or "") for p in pats)]
@@ -343,8 +235,11 @@ def rag_query(corpus: str, query: str, top_k: int = 8,
         # The reranker then decides the final order by true relevance -- no
         # fragile output-balancing/dominance toggle needed.
         stratified = bool(balance)
-        pool = (_stratified_pool(leaves, RERANK_POOL) if stratified
-                else leaves[:RERANK_POOL])
+        if stratified:
+            from .domains.building_codes.retrieval import _stratified_pool
+            pool = _stratified_pool(leaves, RERANK_POOL)
+        else:
+            pool = leaves[:RERANK_POOL]
         rr = rerank(query, [lf.get("text") or "" for lf in pool])
         used_rerank = rr is not None
         if used_rerank:

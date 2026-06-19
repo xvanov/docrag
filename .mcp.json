@@ -1,8 +1,12 @@
 {
   "mcpServers": {
-    "docrag": {
-      "command": "C:\\repos\\docrag\\.venv\\Scripts\\python.exe",
-      "args": ["-m", "docrag.mcp_server"]
+    "rag-building-codes": {
+      "command": "/home/k/docrag/.venv/bin/python",
+      "args": ["-m", "rag.mcp_server"]
+    },
+    "rag-youtube": {
+      "command": "/home/k/docrag/.venv/bin/python",
+      "args": ["-m", "rag.domains.youtube.mcp_server"]
     }
   }
 }

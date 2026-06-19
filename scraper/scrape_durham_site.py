@@ -13,7 +13,7 @@ with <meta name="book"> / <meta name="chapter"> provenance, so the HTML
 extractor labels citations nicely. Re-run is idempotent (overwrites).
 
 Usage:  python scraper/scrape_durham_site.py
-Then:   python -m docrag.index build --corpus building-codes --confirm
+Then:   python -m rag.index build --corpus building-codes --confirm
 """
 import os
 import re

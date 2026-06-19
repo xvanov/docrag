@@ -4,10 +4,10 @@ For the multi-source `building-codes` corpus this defaults to jurisdiction-
 balanced retrieval (model IBC + NC 2024 state code + Durham UDO) so one
 question is answered from all three layers, with each claim attributed.
 
-    python -m docrag.ask "min stair riser height for an exit stair?"
-    python -m docrag.ask --corpus udo "what is a major site plan?"
-    python -m docrag.ask --no-balance --top-k 12 "..."   # plain retrieval
-    python -m docrag.ask --sources "fire separation distance"   # chunks only
+    python -m rag.ask "min stair riser height for an exit stair?"
+    python -m rag.ask --corpus udo "what is a major site plan?"
+    python -m rag.ask --no-balance --top-k 12 "..."   # plain retrieval
+    python -m rag.ask --sources "fire separation distance"   # chunks only
 """
 from __future__ import annotations
 
@@ -31,7 +31,7 @@ def _print_sources(chunks: list[dict]) -> None:
 
 
 def main(argv=None) -> int:
-    ap = argparse.ArgumentParser(prog="docrag.ask")
+    ap = argparse.ArgumentParser(prog="rag.ask")
     ap.add_argument("query", nargs="+", help="the question")
     ap.add_argument("--corpus", default="building-codes")
     ap.add_argument("--location", default="durham-nc",

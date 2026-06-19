@@ -113,10 +113,43 @@ def enumerate_targets(targets: Iterable[str], limit: int = 0) -> list[dict]:
     return out
 
 
-def fetch_transcript(video_id: str, languages: list[str]) -> tuple[list[dict], str, bool]:
+def _build_proxy_config():
+    """Build a youtube-transcript-api ProxyConfig from settings, or None.
+
+    Bulk transcript pulls get per-IP rate-limited by YouTube; routing through a
+    rotating residential proxy avoids it. Two options:
+      - Webshare residential (recommended; auto-rotates + retries on block):
+          RAG_YT_WEBSHARE_USERNAME, RAG_YT_WEBSHARE_PASSWORD
+      - Generic proxy: RAG_YT_PROXY_HTTP and/or RAG_YT_PROXY_HTTPS (full URLs,
+        creds embedded, e.g. http://user:pass@host:port)
+    """
+    ws_user = settings.get("RAG_YT_WEBSHARE_USERNAME", "")
+    ws_pass = settings.get("RAG_YT_WEBSHARE_PASSWORD", "")
+    if ws_user and ws_pass:
+        from youtube_transcript_api.proxies import WebshareProxyConfig
+        return WebshareProxyConfig(proxy_username=ws_user, proxy_password=ws_pass)
+    http_url = settings.get("RAG_YT_PROXY_HTTP", "") or settings.get("RAG_YT_PROXY", "")
+    https_url = settings.get("RAG_YT_PROXY_HTTPS", "") or http_url
+    if http_url or https_url:
+        from youtube_transcript_api.proxies import GenericProxyConfig
+        return GenericProxyConfig(http_url=http_url or None, https_url=https_url or None)
+    return None
+
+
+def proxy_label() -> str:
+    """Non-secret description of the active proxy, for logging."""
+    if settings.get("RAG_YT_WEBSHARE_USERNAME", "") and settings.get("RAG_YT_WEBSHARE_PASSWORD", ""):
+        return "webshare residential"
+    if settings.get("RAG_YT_PROXY_HTTP", "") or settings.get("RAG_YT_PROXY_HTTPS", "") \
+            or settings.get("RAG_YT_PROXY", ""):
+        return "generic proxy"
+    return "none (direct)"
+
+
+def fetch_transcript(video_id: str, languages: list[str], proxy_config=None) -> tuple[list[dict], str, bool]:
     """Return ([{text,start,duration}], language_code, is_generated)."""
     from youtube_transcript_api import YouTubeTranscriptApi
-    api = YouTubeTranscriptApi()
+    api = YouTubeTranscriptApi(proxy_config=proxy_config)
     fetched = api.fetch(video_id, languages=languages)
     snippets = [{"text": s.text, "start": float(s.start),
                  "duration": float(s.duration)} for s in fetched]
@@ -163,7 +196,9 @@ def ingest(corpus: str, targets: list[str], languages: list[str] | None = None,
     """
     languages = languages or ["en"]
     sleep_s = float(settings.get("RAG_YT_SLEEP", 1.0) or 1.0) if sleep is None else sleep
+    proxy_config = _build_proxy_config()
     print("[corpus] %s  (index: %s)" % (corpus, settings.index_dir()))
+    print("[proxy] %s" % proxy_label())
     print("[enumerate] resolving %d target(s)..." % len(targets))
     videos = enumerate_targets(targets, limit=limit)
     print("[enumerate] %d video(s)" % len(videos))
@@ -194,7 +229,8 @@ def ingest(corpus: str, targets: list[str], languages: list[str] | None = None,
             snippets = lang = is_gen = None
             for attempt in range(_BLOCK_RETRIES + 1):
                 try:
-                    snippets, lang, is_gen = fetch_transcript(vid, languages)
+                    snippets, lang, is_gen = fetch_transcript(vid, languages,
+                                                              proxy_config=proxy_config)
                     consecutive_blocks = 0
                     break
                 except Exception as e:  # noqa: BLE001
